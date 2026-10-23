@@ -172,3 +172,4 @@ class PluginSettingsManager(object):
         # type: (str) -> None
         self._set_raw("results_dir", os.path.abspath(os.path.expanduser(path)))
         self._flush()
+
