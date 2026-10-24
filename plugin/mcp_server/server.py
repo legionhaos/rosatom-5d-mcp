@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Model Context Protocol (MCP) Server for STE Slicer tools.
-
-Registers and executes tool handlers for:
-- analyze_mesh_geometry
-- select_print_mode_and_profile
-- modify_scene_and_parameters
-- run_slicing_and_generate_gcode
-"""
-
 import json
 import logging
 from typing import Dict, Any, List, Optional, Union
@@ -16,19 +6,29 @@ from typing import Dict, Any, List, Optional, Union
 logger = logging.getLogger("MCPServer")
 
 
-class MCPServer(object):
-    """
-    MCP Server managing registration, schema generation, and execution of slicer tools.
-    """
+class BaseMCPTool(object):
+    name = ""
+    description = ""
+    parameters_schema = {}  # type: Dict[str, Any]
 
-    def __init__(self):
-        # type: () -> None
+    def execute(self, **kwargs):
+        # type: (**Any) -> Dict[str, Any]
+        raise NotImplementedError
+
+
+class MCPServer(object):
+
+    def __init__(self, settings_mgr=None, event_listener=None, camera_manager=None, dispatcher=None):
+        # type: (Any, Any, Any, Any) -> None
         self._handlers = {}  # type: Dict[str, Any]
+        self._settings_mgr = settings_mgr
+        self._event_listener = event_listener
+        self._camera_manager = camera_manager
+        self._dispatcher = dispatcher
         self._register_default_tools()
 
     def register_tool(self, name, description, parameters, handler):
         # type: (str, str, Dict[str, Any], Any) -> None
-        """Registers a tool with its schema and handler function."""
         self._handlers[name] = {
             "schema": {
                 "type": "function",
@@ -40,6 +40,18 @@ class MCPServer(object):
             },
             "handler": handler
         }
+
+    def register_tool_instance(self, tool):
+        # type: (BaseMCPTool) -> None
+        def _handler(args, _tool=tool):
+            return _tool.execute(**(args or {}))
+
+        self.register_tool(
+            name=tool.name,
+            description=tool.description,
+            parameters=tool.parameters_schema or {"type": "object", "properties": {}},
+            handler=_handler
+        )
 
     def get_tools_schema(self):
         # type: () -> List[Dict[str, Any]]
@@ -84,171 +96,21 @@ class MCPServer(object):
 
     def _register_default_tools(self):
         # type: () -> None
-        """Registers the 4 mandatory pipeline tools."""
-        self.register_tool(
-            name="analyze_mesh_geometry",
-            description="Анализирует геометрические характеристики 3D-модели (габариты, объем, нависания, толщину стенок и ориентацию).",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "model_id": {
-                        "type": "string",
-                        "description": "Идентификатор или имя модели в сцене."
-                    },
-                    "model_path": {
-                        "type": "string",
-                        "description": "Путь к файлу 3D-модели (.stl, .3mf, .obj)."
-                    }
-                }
-            },
-            handler=self._default_analyze_mesh
-        )
+        from plugin.mcp_server.tools.geometry_tool import GeometryAnalysisTool
+        from plugin.mcp_server.tools.scene_transform_tool import SceneTransformTool
+        from plugin.mcp_server.tools.profile_mode_tool import ProfileModeTool
+        from plugin.mcp_server.tools.slicing_export_tool import SlicingTool, ValidateExportTool
 
-        self.register_tool(
-            name="select_print_mode_and_profile",
-            description="Выбирает режим печати (5D Multi-Axis или 3D Planar), базовый профиль качества и материал.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "mode": {
-                        "type": "string",
-                        "enum": ["5D", "3D"],
-                        "description": "Режим печати: '5D' (многоосевая печать) или '3D' (классическая трехосевая)."
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Имя профиля качества (например, '5D_structural', '5D_precision', '3D_standard')."
-                    },
-                    "material": {
-                        "type": "string",
-                        "description": "Имя материала филамента (например, 'PA6-CF', 'PETG', 'PLA', 'ABS', 'TPU')."
-                    }
-                },
-                "required": ["mode", "profile", "material"]
-            },
-            handler=self._default_select_profile
-        )
-
-        self.register_tool(
-            name="modify_scene_and_parameters",
-            description="Применяет углы поворота детали и настраивает технологические параметры нарезки (температуры, стенки, заполнение, обдув).",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "rotation_deg": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "description": "Углы поворота детали [rx, ry, rz] в градусах."
-                    },
-                    "layer_height_mm": {
-                        "type": "number",
-                        "description": "Высота слоя в миллиметрах (например, 0.2)."
-                    },
-                    "wall_line_count": {
-                        "type": "integer",
-                        "description": "Количество контуров/периметров стенок."
-                    },
-                    "infill_density_pct": {
-                        "type": "number",
-                        "description": "Плотность заполнения в процентах (0-100)."
-                    },
-                    "infill_pattern": {
-                        "type": "string",
-                        "description": "Рисунок заполнения ('gyroid', 'cubic', 'grid')."
-                    },
-                    "print_temperature_c": {
-                        "type": "number",
-                        "description": "Температура сопла экструдера в градусах Цельсия."
-                    },
-                    "bed_temperature_c": {
-                        "type": "number",
-                        "description": "Температура подогреваемого стола в градусах Цельсия."
-                    },
-                    "fan_speed_pct": {
-                        "type": "number",
-                        "description": "Скорость вентилятора охлаждения в процентах (0-100)."
-                    },
-                    "support_enabled": {
-                        "type": "boolean",
-                        "description": "Включить генерацию поддержек (False для Support-Free в 5D)."
-                    }
-                }
-            },
-            handler=self._default_modify_scene
-        )
-
-        self.register_tool(
-            name="run_slicing_and_generate_gcode",
-            description="Запускает процесс слайсинга в STE Slicer, рассчитывает время печати, расход нити и формирует G-код.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "export_gcode_path": {
-                        "type": "string",
-                        "description": "Необязательный путь для сохранения сгенерированного файла G-кода."
-                    }
-                }
-            },
-            handler=self._default_run_slicing
-        )
-
-    def _default_analyze_mesh(self, args):
-        # type: (Dict[str, Any]) -> Dict[str, Any]
-        return {
-            "status": "success",
-            "model_id": args.get("model_id", "mesh_01"),
-            "dimensions_mm": [60.0, 60.0, 25.0],
-            "volume_cm3": 45.2,
-            "has_overhangs": True,
-            "max_overhang_angle_deg": 65.0,
-            "is_rotational_symmetry": True,
-            "recommended_mode": "5D",
-            "message": "Геометрия успешно проанализирована: деталь содержит нависания 65° и тела вращения, рекомендуется 5D."
-        }
-
-    def _default_select_profile(self, args):
-        # type: (Dict[str, Any]) -> Dict[str, Any]
-        return {
-            "status": "success",
-            "mode": args.get("mode", "5D"),
-            "profile": args.get("profile", "5D_structural"),
-            "material": args.get("material", "PA6-CF"),
-            "message": "Выбран режим {0}, профиль '{1}', материал '{2}'.".format(
-                args.get("mode", "5D"), args.get("profile", "5D_structural"), args.get("material", "PA6-CF")
-            )
-        }
-
-    def _default_modify_scene(self, args):
-        # type: (Dict[str, Any]) -> Dict[str, Any]
-        return {
-            "status": "success",
-            "applied_rotation_deg": args.get("rotation_deg", [0.0, 0.0, 0.0]),
-            "applied_parameters": {
-                "layer_height_mm": args.get("layer_height_mm", 0.2),
-                "wall_line_count": args.get("wall_line_count", 4),
-                "infill_density_pct": args.get("infill_density_pct", 50),
-                "infill_pattern": args.get("infill_pattern", "gyroid"),
-                "print_temperature_c": args.get("print_temperature_c", 275),
-                "bed_temperature_c": args.get("bed_temperature_c", 90),
-                "fan_speed_pct": args.get("fan_speed_pct", 0),
-                "support_enabled": args.get("support_enabled", False)
-            },
-            "message": "Параметры сцены и технологические настройки слайсера успешно применены."
-        }
-
-    def _default_run_slicing(self, args):
-        # type: (Dict[str, Any]) -> Dict[str, Any]
-        return {
-            "status": "success",
-            "slicing_result": "G-code successfully generated",
-            "print_time_sec": 4200,
-            "print_time_formatted": "1 ч 10 мин",
-            "material_weight_g": 52.4,
-            "filament_length_m": 16.8,
-            "layer_count": 125,
-            "mode_used": "5D",
-            "message": "Слайсинг успешно завершен. Сгенерирован 5D G-код: время 1ч 10м, масса 52.4 г."
-        }
+        for tool in (
+            GeometryAnalysisTool(),
+            ProfileModeTool(settings_mgr=self._settings_mgr),
+            SceneTransformTool(),
+            SlicingTool(event_listener=self._event_listener),
+            ValidateExportTool(settings_mgr=self._settings_mgr,
+                               camera_manager=self._camera_manager,
+                               dispatcher=self._dispatcher),
+        ):
+            self.register_tool_instance(tool)
 
 
-__all__ = ["MCPServer"]
+__all__ = ["MCPServer", "BaseMCPTool"]
