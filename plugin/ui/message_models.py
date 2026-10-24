@@ -5,7 +5,60 @@ logic stays outside the UI layer and feeds these models through the controller.
 The code is compatible with the Python version shipped with Cura 3.6.
 """
 
-from PyQt5.QtCore import QAbstractListModel, QModelIndex, Qt, pyqtSignal, pyqtSlot
+try:
+    from PyQt5.QtCore import QAbstractListModel, QModelIndex, Qt, pyqtSignal, pyqtSlot
+except ImportError:
+    try:
+        from PyQt6.QtCore import QAbstractListModel, QModelIndex, Qt, pyqtSignal, pyqtSlot
+    except ImportError:
+        try:
+            from PySide2.QtCore import QAbstractListModel, QModelIndex, Qt, Signal as pyqtSignal, Slot as pyqtSlot
+        except ImportError:
+            try:
+                from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt, Signal as pyqtSignal, Slot as pyqtSlot
+            except ImportError:
+                class QModelIndex(object):
+                    def isValid(self):
+                        return False
+                    def row(self):
+                        return 0
+
+                class Qt(object):
+                    UserRole = 256
+                    DisplayRole = 0
+
+                def pyqtSlot(*args, **kwargs):
+                    def _dec(f):
+                        return f
+                    return _dec
+
+                class pyqtSignal(object):
+                    def __init__(self, *types):
+                        pass
+                    def emit(self, *args):
+                        pass
+                    def connect(self, slot):
+                        pass
+
+                class QAbstractListModel(object):
+                    def __init__(self, parent=None):
+                        self.parent = parent
+                    def beginInsertRows(self, index, first, last):
+                        pass
+                    def endInsertRows(self):
+                        pass
+                    def beginRemoveRows(self, index, first, last):
+                        pass
+                    def endRemoveRows(self):
+                        pass
+                    def beginResetModel(self):
+                        pass
+                    def endResetModel(self):
+                        pass
+                    def dataChanged(self, top_left, bottom_right, roles=None):
+                        pass
+                    dataChanged = pyqtSignal()
+
 
 
 class _ListModel(QAbstractListModel):

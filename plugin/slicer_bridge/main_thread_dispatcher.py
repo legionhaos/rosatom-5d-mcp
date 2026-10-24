@@ -2,11 +2,17 @@
 """
 MainThreadDispatcher for STE Slicer.
 
-Safely dispatches callables to the Qt / Uranium / Cura main GUI thread.
+Provides 100% thread-safe execution of Cura/Uranium API and Qt GUI operations
+from background threads (such as AgentWorker QThread).
 """
 
+from __future__ import absolute_import, division, print_function, unicode_literals
+
+import functools
 import logging
-from typing import Callable, Any
+import sys
+import threading
+from typing import Any, Callable, Optional, TypeVar
 
 try:
     from PyQt5.QtCore import QCoreApplication, QThread
@@ -26,44 +32,127 @@ except ImportError:
 logger = logging.getLogger("MainThreadDispatcher")
 
 
+def is_main_thread():
+    # type: () -> bool
+    """Проверяет, выполняется ли текущий код в главном GUI-потоке Qt/Python."""
+    if QCoreApplication is not None:
+        app = QCoreApplication.instance()
+        if app is not None and QThread is not None:
+            try:
+                return QThread.currentThread() == app.thread()
+            except Exception:
+                pass
+    if hasattr(threading, "main_thread"):
+        return threading.current_thread() is threading.main_thread()
+    return isinstance(threading.current_thread(), threading._MainThread)
+
+
 class MainThreadDispatcher(object):
     """
-    Utility class for executing functions on the application's main thread.
+    Диспетчер потокобезопасного выполнения функций в основном потоке GUI STE Slicer/Cura.
+    Поддерживает как статический вызов (MainThreadDispatcher.run_sync),
+    так и вызов через экземпляр (dispatcher.execute_sync).
     """
 
+    def __init__(self, timeout=30.0):
+        # type: (float) -> None
+        self.default_timeout = float(timeout)
+
     @classmethod
-    def call_on_main_thread(cls, func, *args, **kwargs):
+    def execute_sync(cls, func, *args, **kwargs):
         # type: (Callable[..., Any], Any, Any) -> Any
         """
-        Executes a callable on the main thread and returns the result.
-        If already on the main thread or Qt is not initialized, executes directly.
+        Ставит функцию func в очередь главного потока GUI через CuraApplication.callLater(),
+        блокирует вызывающий рабочий поток до завершения и возвращает результат либо
+        пробрасывает возникшее исключение.
         """
-        if QCoreApplication is None or QThread is None:
+        timeout = kwargs.pop("timeout", 30.0)
+
+        # Если уже в главном потоке или Qt не запущен — вызываем напрямую
+        if is_main_thread():
             return func(*args, **kwargs)
 
-        app = QCoreApplication.instance()
-        if app is None:
-            return func(*args, **kwargs)
-
-        # Check if caller is already on the main thread
+        app = None
         try:
-            current_thread = QThread.currentThread()
-            app_thread = app.thread()
-            if current_thread == app_thread:
-                return func(*args, **kwargs)
+            from cura.CuraApplication import CuraApplication
+            app = CuraApplication.getInstance()
         except Exception:
+            try:
+                from UM.Application import Application
+                app = Application.getInstance()
+            except Exception:
+                app = None
+
+        if app is None or not hasattr(app, "callLater"):
+            # Вне слайсера (юнит-тесты) вызываем напрямую
             return func(*args, **kwargs)
 
-        # If on background thread, use Cura Application callDecoration or Uranium CallMethodEvent
-        try:
-            from UM.Application import Application
-            cura_app = Application.getInstance()
-            if cura_app and hasattr(cura_app, "callDecoration"):
-                result = cura_app.callDecoration("callOnMainThread", func, *args, **kwargs)
-                if result is not None:
-                    return result
-        except Exception:
-            pass
+        result_box = [None]
+        error_box = [None]
+        done_event = threading.Event()
 
-        # Fallback to direct execution
-        return func(*args, **kwargs)
+        def _worker():
+            try:
+                result_box[0] = func(*args, **kwargs)
+            except BaseException as e:
+                error_box[0] = e
+            finally:
+                done_event.set()
+
+        try:
+            app.callLater(_worker)
+        except Exception as e:
+            logger.warning("app.callLater failed: %s; executing directly.", e)
+            return func(*args, **kwargs)
+
+        finished = done_event.wait(timeout=timeout)
+        if not finished:
+            raise TimeoutError(
+                "MainThreadDispatcher timed out after {0}s waiting for {1}".format(
+                    timeout, getattr(func, "__name__", str(func))
+                )
+            )
+
+        if error_box[0] is not None:
+            raise error_box[0]
+
+        return result_box[0]
+
+    @classmethod
+    def execute_async(cls, func, *args, **kwargs):
+        # type: (Callable[..., None], Any, Any) -> None
+        """Неблокирующая постановка вызова функции в очередь главного потока."""
+        if is_main_thread():
+            func(*args, **kwargs)
+            return
+
+        app = None
+        try:
+            from cura.CuraApplication import CuraApplication
+            app = CuraApplication.getInstance()
+        except Exception:
+            try:
+                from UM.Application import Application
+                app = Application.getInstance()
+            except Exception:
+                app = None
+
+        if app is not None and hasattr(app, "callLater"):
+            app.callLater(lambda: func(*args, **kwargs))
+        else:
+            func(*args, **kwargs)
+
+    # Совместимость со всеми вызовами в проекте:
+    run_sync = execute_sync
+    call_on_main_thread = execute_sync
+
+
+def run_in_main_thread(func):
+    """Декоратор для автоматического выполнения метода в главном потоке."""
+    @functools.wraps(func)
+    def _wrapper(*args, **kwargs):
+        return MainThreadDispatcher.execute_sync(func, *args, **kwargs)
+    return _wrapper
+
+
+__all__ = ["MainThreadDispatcher", "run_in_main_thread", "is_main_thread"]

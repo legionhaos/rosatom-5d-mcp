@@ -77,6 +77,14 @@ class AgentOrchestrator(object):
         self.max_iterations = int(max_iterations) if max_iterations is not None else 8
         logger.info("AgentOrchestrator initialized (max_iterations=%d).", self.max_iterations)
 
+    def configure_llm(self, base_url, api_key, model):
+        # type: (str, str, str) -> None
+        """Reconfigures the LLM client with updated credentials."""
+        from plugin.agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
+        cfg = LLMConnectionConfig(base_url=base_url, api_key=api_key, model=model)
+        self.llm_client = OpenAICompatibleClient(cfg)
+        logger.info("AgentOrchestrator LLM client reconfigured: model=%s", model)
+
     def process_user_request(self,
                              user_prompt,
                              attachments=None,

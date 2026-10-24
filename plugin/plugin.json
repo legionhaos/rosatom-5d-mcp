@@ -1,0 +1,9 @@
+{
+  "name": "STE AI 3D/5D Print Assistant",
+  "author": "Hackathon Team",
+  "version": "1.0.0",
+  "description": "Интеллектуальный сервис автоподбора параметров FDM 3D/5D-печати с чат-ботом и MCP-инструментами",
+  "api": 5,
+  "supported_sdk_versions": ["4.0.0", "5.0.0", "6.0.0"],
+  "i18n-catalog": "cura"
+}

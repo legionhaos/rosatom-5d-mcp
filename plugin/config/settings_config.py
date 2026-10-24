@@ -78,6 +78,27 @@ class PluginSettingsManager(object):
                 return self._prefs.getValue(PREFIX + key)
             return self._load_file().get(key, DEFAULTS[key])
 
+    def set(self, key, value):
+        k = str(key)
+        if k.startswith("llm_"):
+            k = k[4:]
+        if k == "base_url":
+            k = "api_url"
+        elif k == "model":
+            k = "model_name"
+        self._set_raw(k, value)
+        self._flush()
+
+    def get(self, key, default=None):
+        k = str(key)
+        if k.startswith("llm_"):
+            k = k[4:]
+        if k == "base_url":
+            k = "api_url"
+        elif k == "model":
+            k = "model_name"
+        return self._get(k)
+
     def _set_raw(self, key, value):
         with self._lock:
             if self._prefs is not None:
@@ -161,10 +182,13 @@ class PluginSettingsManager(object):
     # ---------------------------- results/ -------------------------------- #
     def get_results_root_dir(self):
         # type: () -> str
-        """Корень для results/<model_name>/. По умолчанию ~/STE_AI_results
-        (папка plugins бывает read-only). Перед сдачей копируйте содержимое в results/ архива."""
+        """Корень для results/<model_name>/. Приоритет: UI/env -> локальный results/ -> ~/STE_AI_results."""
         path = str(self._get("results_dir")).strip()
         if not path:
+            workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            candidate = os.path.join(workspace_root, "results")
+            if os.path.isdir(candidate):
+                return os.path.abspath(candidate)
             path = os.path.join(os.path.expanduser("~"), "STE_AI_results")
         return os.path.abspath(os.path.expanduser(path))
 

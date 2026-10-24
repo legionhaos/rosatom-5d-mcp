@@ -18,7 +18,10 @@ import sys
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 # Безопасный импорт контракта MCP и диспетчера
 try:

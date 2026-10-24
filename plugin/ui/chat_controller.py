@@ -12,7 +12,48 @@ import mimetypes
 import os
 import time
 
-from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
+try:
+    from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
+except ImportError:
+    try:
+        from PyQt6.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
+    except ImportError:
+        try:
+            from PySide2.QtCore import QObject, Property as pyqtProperty, Signal as pyqtSignal, Slot as pyqtSlot
+        except ImportError:
+            try:
+                from PySide6.QtCore import QObject, Property as pyqtProperty, Signal as pyqtSignal, Slot as pyqtSlot
+            except ImportError:
+                class QObject(object):
+                    def __init__(self, parent=None):
+                        self.parent = parent
+
+                def pyqtProperty(*args, **kwargs):
+                    def _dec(f):
+                        return property(f)
+                    return _dec
+
+                def pyqtSlot(*args, **kwargs):
+                    def _dec(f):
+                        return f
+                    return _dec
+
+                class pyqtSignal(object):
+                    def __init__(self, *types):
+                        self._slots = []
+                    def emit(self, *args):
+                        for s in list(self._slots):
+                            try:
+                                s(*args)
+                            except Exception:
+                                pass
+                    def connect(self, slot):
+                        if slot not in self._slots:
+                            self._slots.append(slot)
+                    def disconnect(self, slot):
+                        if slot in self._slots:
+                            self._slots.remove(slot)
+
 
 from .message_models import AttachmentListModel, MessageListModel, ToolLogModel
 
@@ -225,6 +266,11 @@ class ChatController(QObject):
     @pyqtSlot(str, str, str)
     def saveSettings(self, base_url, api_key, model):
         if self._settings is not None:
+            if hasattr(self._settings, "save_llm_config") and base_url and api_key and model:
+                try:
+                    self._settings.save_llm_config(base_url, api_key, model)
+                except Exception:
+                    pass
             setter = getattr(self._settings, "set", None)
             if setter is not None:
                 setter("llm_base_url", base_url)
@@ -341,3 +387,14 @@ class ChatController(QObject):
         self._print_time = print_time
         self._material_usage = material_usage
         self.printResultChanged.emit()
+
+
+    # Спецификационные алиасы методов из архитектурного плана:
+    sendMessage = sendPrompt
+    attachFile = addAttachment
+    saveApiSettings = saveSettings
+    exportSubmissionPackage = exportResult
+
+
+ChatViewController = ChatController
+__all__ = ["ChatController", "ChatViewController"]

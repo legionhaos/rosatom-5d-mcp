@@ -196,3 +196,12 @@ class STEPluginLogger(object):
         except Exception:
             pass
         cls.info("MCP %s -> %s (%d ms)" % (tool_name, status, duration_ms), tag="MCP")
+
+
+def get_logger(name=None):
+    """Возвращает стандартный logging.Logger с автоинициализацией STEPluginLogger."""
+    STEPluginLogger._ensure_file_logger()
+    return logging.getLogger(name or "ste_ai_assistant")
+
+
+__all__ = ["STEPluginLogger", "mask_secrets", "get_logger"]

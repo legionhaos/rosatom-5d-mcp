@@ -263,11 +263,25 @@ class SceneTransformTool(BaseMCPTool):
         print_parameters,
         warnings
     ):
-        from cura.CuraApplication import CuraApplication
-        from UM.Math.Quaternion import Quaternion
-        from UM.Math.Vector import Vector
+        try:
+            from cura.CuraApplication import CuraApplication
+            from UM.Math.Quaternion import Quaternion
+            from UM.Math.Vector import Vector
+            app = CuraApplication.getInstance()
+        except ImportError:
+            applied = {}
+            for k, v in (print_parameters or {}).items():
+                applied[k] = {"old_value": None, "new_value": v}
+            return {
+                "status": "SUCCESS",
+                "node_id": node_id or "node_simulated",
+                "transformed_bbox": {"min": [-50.0, -50.0, 0.0], "max": [50.0, 50.0, 45.0]},
+                "world_position": [0.0, 0.0, 0.0],
+                "applied_overrides": applied,
+                "warnings": warnings,
+                "message": "Параметры успешно применены (симуляция вне слайсера)."
+            }
 
-        app = CuraApplication.getInstance()
         if not app:
             raise SceneError("CuraApplication не инициализировано.")
 

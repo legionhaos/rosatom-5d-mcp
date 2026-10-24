@@ -111,8 +111,14 @@ class AgentWorker(QThread):
         workerError(error_message): Emitted if an unhandled error occurs during execution.
     """
 
-    toolCallStarted = pyqtSignal(str, str, str)
-    toolCallFinished = pyqtSignal(str, str, str, int)
+    # Signals for ChatController / UI integration:
+    stepStarted = pyqtSignal(str, str)
+    toolCallStarted = pyqtSignal(str, str, object)
+    toolCallFinished = pyqtSignal(str, str, object, int)
+    responseReady = pyqtSignal(object)
+    taskFailed = pyqtSignal(str)
+
+    # Legacy / Direct signals:
     finalAnswerReceived = pyqtSignal(str, dict)
     workerError = pyqtSignal(str)
 
@@ -131,6 +137,7 @@ class AgentWorker(QThread):
         self.attachment_paths = []  # type: List[str]
         self._is_cancelled = False
         self._final_answer_emitted = False
+        self._active_calls = {}
 
     def set_task(self, user_prompt, attachment_paths=None):
         # type: (str, Optional[List[str]]) -> None
@@ -163,6 +170,37 @@ class AgentWorker(QThread):
         logger.info("AgentWorker cancellation requested.")
 
     stop = cancel
+
+    def send_prompt(self, user_prompt, attachment_paths=None):
+        # type: (str, Optional[List[str]]) -> None
+        """Enqueues task and starts background worker thread."""
+        self.set_task(user_prompt, attachment_paths)
+        self.start()
+
+    submit_prompt = send_prompt
+    handle_prompt = send_prompt
+    enqueue_task = send_prompt
+
+    def check_connection(self, base_url, api_key, model):
+        # type: (str, str, str) -> bool
+        """Validates connection to the OpenAI-compatible provider."""
+        try:
+            from plugin.agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
+            cfg = LLMConnectionConfig(base_url=base_url, api_key=api_key, model=model, timeout=10.0)
+            client = OpenAICompatibleClient(cfg)
+            ok, _ = client.test_connection()
+            return ok
+        except Exception as e:
+            logger.warning("check_connection error: %s", e)
+            return False
+
+    checkConnection = check_connection
+
+    def configure(self, base_url, api_key, model):
+        # type: (str, str, str) -> None
+        """Configures LLM credentials on the orchestrator."""
+        if self.orchestrator and hasattr(self.orchestrator, "configure_llm"):
+            self.orchestrator.configure_llm(base_url, api_key, model)
 
     @property
     def is_cancelled(self):
@@ -240,7 +278,8 @@ class AgentWorker(QThread):
             args_str = str(args_json or "{}")
 
         logger.debug("Tool call started: %s (%s)", tool_name, call_id)
-        self.toolCallStarted.emit(str(call_id), str(tool_name), args_str)
+        self._active_calls[str(call_id)] = str(tool_name)
+        self.toolCallStarted.emit(str(tool_name), str(call_id), args_json)
 
     tool_call_started = on_tool_call_started
 
@@ -255,8 +294,9 @@ class AgentWorker(QThread):
             summary: Brief human-readable summary of the execution outcome.
             duration_ms: Execution duration in milliseconds.
         """
-        logger.debug("Tool call finished: %s [%s] in %dms: %s", call_id, status, duration_ms, summary)
-        self.toolCallFinished.emit(str(call_id), str(status), str(summary), int(duration_ms))
+        tool_name = self._active_calls.pop(str(call_id), str(call_id))
+        logger.debug("Tool call finished: %s (%s) [%s] in %dms: %s", tool_name, call_id, status, duration_ms, summary)
+        self.toolCallFinished.emit(str(tool_name), str(status), summary, int(duration_ms))
 
     tool_call_finished = on_tool_call_finished
 
@@ -272,6 +312,7 @@ class AgentWorker(QThread):
         self._final_answer_emitted = True
         summary = dict(summary_card_dict) if isinstance(summary_card_dict, dict) else {}
         logger.info("Final answer received (%d chars)", len(markdown_answer or ""))
+        self.responseReady.emit({"text": str(markdown_answer or ""), "summary": summary})
         self.finalAnswerReceived.emit(str(markdown_answer or ""), summary)
 
     final_answer_received = on_final_answer_received
@@ -285,6 +326,7 @@ class AgentWorker(QThread):
             error_message: Error description string.
         """
         logger.error("AgentWorker error callback: %s", error_message)
+        self.taskFailed.emit(str(error_message))
         self.workerError.emit(str(error_message))
 
     worker_error = on_error
