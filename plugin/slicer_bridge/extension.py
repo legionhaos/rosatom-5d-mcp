@@ -103,6 +103,21 @@ class AgentBackendAdapter(QObject):
         self._worker.set_task(text, paths)
         self._worker.start()
 
+    def apply_parameters(self, parameters):
+        """Apply explicit UI parameter values directly via MCP, without an LLM round trip."""
+        if self._orchestrator is None or self._orchestrator.mcp_server is None:
+            return False, {"status": "error", "error": "MCPServer недоступен."}
+        try:
+            result = self._orchestrator.mcp_server.call_tool(
+                "modify_scene_and_parameters",
+                {"print_parameters": dict(parameters), "auto_arrange_on_plate": False}
+            )
+            ok = isinstance(result, dict) and str(result.get("status", "")).lower() not in ("error", "failed")
+            return ok, result
+        except Exception as exc:
+            logger.exception("Direct parameter apply failed: %s", exc)
+            return False, {"status": "error", "error": str(exc)}
+
     def cancel(self):
         if self._worker is not None:
             cancel = getattr(self._worker, "cancel", None)
@@ -143,7 +158,7 @@ class AgentBackendAdapter(QObject):
             self.taskFailed.emit(message)
         return ok, message
 
-    def _on_tool_started(self, tool_name, call_id, args_json):
+    def _on_tool_started(self, call_id, tool_name, args_json):
         self._call_names[str(call_id)] = str(tool_name)
         try:
             arguments = json.loads(args_json) if isinstance(args_json, str) else (args_json or {})
@@ -190,15 +205,23 @@ class STEAIExtension(QObject, Extension):
         self._register_application_hook()
 
     def _application(self):
+        if self._app_override is not None:
+            return self._app_override
         try:
             from cura.CuraApplication import CuraApplication
-            return CuraApplication.getInstance()
+            app = CuraApplication.getInstance()
+            if app is not None:
+                return app
         except Exception:
-            try:
-                from UM.Application import Application
-                return Application.getInstance()
-            except Exception:
-                return None
+            pass
+        try:
+            from UM.Application import Application
+            app = Application.getInstance()
+            if app is not None:
+                return app
+        except Exception:
+            pass
+        return None
 
     def _build_components(self):
         app = self._application()

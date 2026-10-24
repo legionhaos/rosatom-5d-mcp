@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
+import traceback
 from typing import Dict, Any, List, Optional, Union
 
-logger = logging.getLogger("MCPServer")
+try:
+    from plugin.utils.logger import get_logger
+    logger = get_logger("MCPServer")
+except Exception:
+    logger = logging.getLogger("MCPServer")
 
 
 class BaseMCPTool(object):
@@ -81,7 +86,12 @@ class MCPServer(object):
             try:
                 args = json.loads(arguments_json) if arguments_json.strip() else {}
             except Exception as e:
-                return {"status": "error", "error": "Invalid JSON arguments: {0}".format(e)}
+                logger.exception("Invalid JSON arguments for MCP tool '%s'.", tool_name)
+                return {"status": "error", "error": "Invalid JSON arguments: {0}".format(e), "traceback": traceback.format_exc()}
+            if not isinstance(args, dict):
+                err = "MCP tool arguments must be a JSON object."
+                logger.error("Invalid argument shape for MCP tool '%s': %s", tool_name, type(args).__name__)
+                return {"status": "error", "error": err}
         elif isinstance(arguments_json, dict):
             args = arguments_json
         else:
@@ -92,7 +102,7 @@ class MCPServer(object):
             return handler(args)
         except Exception as e:
             logger.exception("Error executing tool '%s': %s", tool_name, e)
-            return {"status": "error", "error": str(e)}
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
     def _register_default_tools(self):
         # type: () -> None

@@ -19,7 +19,11 @@ except ImportError:
                 QCoreApplication = None
                 QThread = None
 
-logger = logging.getLogger("MainThreadDispatcher")
+try:
+    from plugin.utils.logger import get_logger
+    logger = get_logger("MainThreadDispatcher")
+except Exception:
+    logger = logging.getLogger("MainThreadDispatcher")
 
 _DEFAULT_TIMEOUT_SEC = 30.0
 
@@ -37,9 +41,12 @@ class MainThreadDispatcher(object):
             pass
         try:
             from cura.CuraApplication import CuraApplication
-            return CuraApplication.getInstance()
+            app = CuraApplication.getInstance()
+            if app is not None:
+                return app
         except Exception:
-            return None
+            pass
+        return None
 
     @classmethod
     def is_main_thread(cls):
@@ -98,7 +105,9 @@ class MainThreadDispatcher(object):
                 done.set()
 
         if not cls._post_to_main_thread(_runner):
-            return func(*args, **kwargs)
+            logger.error("Cannot dispatch '%s' to GUI thread: application/event loop unavailable.",
+                         getattr(func, "__name__", repr(func)))
+            raise RuntimeError("Не удалось передать операцию в главный поток Cura: приложение недоступно.")
 
         if not done.wait(timeout):
             raise TimeoutError(
@@ -127,14 +136,14 @@ class MainThreadDispatcher(object):
                 func(*args, **kwargs)
                 return True
             except Exception as exc:
-                logger.error("execute_async direct call failed: %s", exc)
+                logger.exception("execute_async direct call failed: %s", exc)
                 return False
 
         def _runner():
             try:
                 func(*args, **kwargs)
             except Exception as exc:
-                logger.error("execute_async main-thread call failed: %s", exc)
+                logger.exception("execute_async main-thread call failed: %s", exc)
 
         return cls._post_to_main_thread(_runner)
 

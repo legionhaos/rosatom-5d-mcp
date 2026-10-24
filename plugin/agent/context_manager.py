@@ -392,21 +392,20 @@ class ConversationContextManager(object):
             "kinematics": "5D Multi-Axis (3 Linear + 2 Rotary C/B)",
             "nozzle_diameter_mm": 0.4
         }
-        current_mode = "5D"
-        current_material = "PA6-CF"
-        current_profile = "5D_structural"
-        key_params = {
-            "layer_height_mm": 0.2,
-            "wall_line_count": 4,
-            "infill_density_pct": 50,
-            "infill_pattern": "gyroid",
-            "print_temperature_c": 275,
-            "bed_temperature_c": 90,
-            "fan_speed_pct": 0,
-            "support_enabled": False
-        }
+        current_mode = ""
+        current_material = ""
+        current_profile = ""
+        available_materials = []
+        available_profiles = []
+        key_params = {}
 
         try:
+            registry = app.getContainerRegistry() if hasattr(app, "getContainerRegistry") else None
+            if registry is not None:
+                finder = getattr(registry, "findContainers", None) or getattr(registry, "findInstanceContainers", None)
+                if finder is not None:
+                    containers = finder(type="material") or []
+                    available_materials = [str(c.getName()) for c in containers if hasattr(c, "getName")]
             stack = app.getGlobalContainerStack()
             if stack:
                 if hasattr(stack, "getName"):
@@ -414,6 +413,9 @@ class ConversationContextManager(object):
 
                 if hasattr(stack, "material") and stack.material:
                     current_material = stack.material.getName()
+                quality = getattr(stack, "quality", None)
+                if quality is not None and hasattr(quality, "getName"):
+                    current_profile = str(quality.getName())
 
                 mode_val = stack.getProperty("ste_print_mode", "value")
                 if mode_val in ("5D", "3D"):
@@ -455,6 +457,8 @@ class ConversationContextManager(object):
             "current_mode": current_mode,
             "current_material": current_material,
             "current_profile": current_profile,
+            "available_materials": available_materials,
+            "available_profiles": available_profiles,
             "key_parameters": key_params
         }
 
@@ -480,21 +484,12 @@ class ConversationContextManager(object):
                 "max_build_volume_mm": [250, 250, 250]
             },
             "loaded_models": models,
-            "current_mode": "5D",
-            "current_material": "PA6-CF",
-            "current_profile": "5D_structural",
-            "available_materials": ["PA6-CF", "PETG", "PLA", "ABS", "TPU"],
-            "available_profiles": ["5D_structural", "5D_precision", "3D_standard", "3D_heavy_duty"],
-            "key_parameters": {
-                "layer_height_mm": 0.2,
-                "wall_line_count": 4,
-                "infill_density_pct": 50,
-                "infill_pattern": "gyroid",
-                "print_temperature_c": 275,
-                "bed_temperature_c": 90,
-                "fan_speed_pct": 0,
-                "support_enabled": False
-            }
+            "current_mode": "",
+            "current_material": "",
+            "current_profile": "",
+            "available_materials": [],
+            "available_profiles": [],
+            "key_parameters": {}
         }
 
     @staticmethod

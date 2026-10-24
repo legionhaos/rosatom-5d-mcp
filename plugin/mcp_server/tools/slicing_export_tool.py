@@ -149,11 +149,24 @@ class SlicingTool(BaseMCPTool):
             return format_exception_for_llm(exc)
 
     def _trigger_slice(self):
-        from cura.CuraApplication import CuraApplication
+        try:
+            from cura.CuraApplication import CuraApplication
+        except ImportError:
+            CuraApplication = None
 
-        app = CuraApplication.getInstance()
+        app = None
+        try:
+            from UM.Application import Application
+            app = Application.getInstance()
+        except Exception:
+            pass
+        if app is None and CuraApplication is not None:
+            try:
+                app = CuraApplication.getInstance()
+            except Exception as exc:
+                raise SceneError("Не удалось получить экземпляр приложения: {0}".format(exc))
         if not app:
-            raise SceneError("CuraApplication не инициализировано.")
+            raise SceneError("Приложение слайсера не инициализировано.")
 
         backend = app.getBackend()
         if backend is None:
@@ -168,9 +181,22 @@ class SlicingTool(BaseMCPTool):
 
     def _collect_slice_stats(self):
         # type: () -> Dict[str, Any]
-        from cura.CuraApplication import CuraApplication
+        try:
+            from cura.CuraApplication import CuraApplication
+        except ImportError:
+            CuraApplication = None
 
-        app = CuraApplication.getInstance()
+        app = None
+        try:
+            from UM.Application import Application
+            app = Application.getInstance()
+        except Exception:
+            pass
+        if app is None and CuraApplication is not None:
+            try:
+                app = CuraApplication.getInstance()
+            except Exception as exc:
+                raise SceneError("Не удалось получить экземпляр приложения: {0}".format(exc))
         stats = {
             "print_time_sec": None,
             "print_time_formatted": None,

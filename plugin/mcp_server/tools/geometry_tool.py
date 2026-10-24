@@ -197,8 +197,18 @@ class GeometryAnalysisTool(BaseMCPTool):
 
     def _resolve_scene_node(self, file_path=None, node_id=None):
         """Find existing scene node or load model file via MeshFileHandler."""
-        from cura.CuraApplication import CuraApplication
-        app = CuraApplication.getInstance()
+        app = None
+        try:
+            from UM.Application import Application
+            app = Application.getInstance()
+        except Exception:
+            pass
+        if app is None:
+            try:
+                from cura.CuraApplication import CuraApplication
+                app = CuraApplication.getInstance()
+            except Exception as exc:
+                raise SceneError("Не удалось получить экземпляр приложения: {0}".format(exc))
         if not app:
             raise SceneError("CuraApplication instance is unavailable.")
 
@@ -222,11 +232,18 @@ class GeometryAnalysisTool(BaseMCPTool):
             if not mesh_file_handler:
                 raise SceneError("MeshFileHandler is unavailable.")
 
-            loaded = mesh_file_handler.read(file_path)
-            if loaded:
-                if isinstance(loaded, list) and len(loaded) > 0:
-                    return loaded[0]
-                return loaded
+            reader = getattr(mesh_file_handler, "read", None)
+            if reader is not None:
+                loaded = reader(file_path)
+                if loaded:
+                    if isinstance(loaded, list) and len(loaded) > 0:
+                        return loaded[0]
+                    return loaded
+            else:
+                # STE Slicer 7.10 exposes no synchronous read() method. The file
+                # is normally already loaded by the attachment flow; use the
+                # current scene node instead of calling a non-existent API.
+                pass
 
             children = [c for c in scene.getRoot().getAllChildren() if hasattr(c, "getMeshData") and c.getMeshData()]
             if children:
@@ -268,11 +285,29 @@ class GeometryAnalysisTool(BaseMCPTool):
 
         vertices = np.asarray(verts_raw, dtype=np.float64).reshape((-1, 3))
 
+        # Uranium/Slicer MeshData vertices are in node-local coordinates.
+        # getWorldTransformation() may return a wrapper whose getData() layout
+        # differs between builds, so prefer the scene node's bounding box in world space.
         world_transform = getattr(node, "getWorldTransformation", lambda: None)()
-        if world_transform is not None and hasattr(world_transform, "getData"):
-            mat4 = np.asarray(world_transform.getData(), dtype=np.float64).reshape((4, 4))
-            homo_verts = np.hstack([vertices, np.ones((vertices.shape[0], 1), dtype=np.float64)])
-            vertices = np.dot(homo_verts, mat4.T)[:, :3]
+        if world_transform is not None:
+            try:
+                from UM.Math.Vector import Vector
+                vertices_world = []
+                for vertex in vertices:
+                    point = Vector(float(vertex[0]), float(vertex[1]), float(vertex[2]))
+                    transformed = world_transform * point
+                    vertices_world.append([float(transformed.x), float(transformed.y), float(transformed.z)])
+                vertices = np.asarray(vertices_world, dtype=np.float64)
+            except Exception:
+                if hasattr(world_transform, "getData"):
+                    mat4 = np.asarray(world_transform.getData(), dtype=np.float64).reshape((4, 4))
+                    homo_verts = np.hstack([vertices, np.ones((vertices.shape[0], 1), dtype=np.float64)])
+                    vertices = np.dot(homo_verts, mat4.T)[:, :3]
+
+        if not np.all(np.isfinite(vertices)):
+            raise MeshError("Mesh vertices contain non-finite coordinates.")
+        if len(vertices) and float(np.max(np.ptp(vertices, axis=0))) <= 1e-9:
+            raise MeshError("Mesh has zero-size bounds after applying its scene transform.")
 
         vertices_print = np.zeros_like(vertices)
         vertices_print[:, 0] = vertices[:, 0]

@@ -230,13 +230,26 @@ class SceneTransformTool(BaseMCPTool):
         warnings
     ):
         """Internal transformation pipeline executed synchronously on the Qt main thread."""
-        from cura.CuraApplication import CuraApplication
+        try:
+            from cura.CuraApplication import CuraApplication
+        except ImportError:
+            CuraApplication = None
         from UM.Math.Quaternion import Quaternion
         from UM.Math.Vector import Vector
 
-        app = CuraApplication.getInstance()
+        app = None
+        try:
+            from UM.Application import Application
+            app = Application.getInstance()
+        except Exception:
+            pass
+        if app is None and CuraApplication is not None:
+            try:
+                app = CuraApplication.getInstance()
+            except Exception as exc:
+                raise SceneError("Не удалось получить экземпляр приложения: {0}".format(exc))
         if not app:
-            raise SceneError("CuraApplication is not initialized.")
+            raise SceneError("Приложение слайсера не инициализировано.")
 
         scene = app.getController().getScene()
         if not scene:
@@ -393,8 +406,9 @@ class SceneTransformTool(BaseMCPTool):
             if not os.path.exists(file_path):
                 raise MeshError("File not found: {}".format(file_path))
             handler = app.getMeshFileHandler()
-            if handler:
-                loaded = handler.read(file_path)
+            reader = getattr(handler, "read", None) if handler is not None else None
+            if reader is not None:
+                loaded = reader(file_path)
                 if loaded:
                     if isinstance(loaded, list) and len(loaded) > 0:
                         return loaded[0]

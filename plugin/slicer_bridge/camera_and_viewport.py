@@ -63,9 +63,12 @@ class ViewportCameraManager(object):
 
         presets = {
             "3d_isometric": Vector(-250, 250, 250),
+            "isometric_alt": Vector(250, 250, 250),
             "front": Vector(0, 100, 350),
-            "top": Vector(0, 400, 1),
+            "back": Vector(0, 100, -350),
+            "top": Vector(0, 420, 1),
             "right": Vector(350, 100, 0),
+            "left": Vector(-350, 100, 0),
         }
         target = presets.get(view_angle, presets["3d_isometric"])
 
@@ -76,6 +79,77 @@ class ViewportCameraManager(object):
             return True
         except Exception as exc:
             logger.warning("focus_on_build_plate failed: %s", exc)
+            return False
+
+    def zoom(self, factor):
+        # type: (float) -> bool
+        return MainThreadDispatcher.run_sync(self._zoom_impl, factor)
+
+    def _zoom_impl(self, factor):
+        # type: (float) -> bool
+        app = self._application()
+        if app is None:
+            return False
+        controller = app.getController()
+        if controller is None:
+            return False
+        camera = controller.getScene().getActiveCamera() if controller.getScene() else None
+        if camera is None:
+            return False
+        try:
+            from UM.Math.Vector import Vector
+            import math
+            pos = camera.getPosition()
+            dist = math.sqrt(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z)
+            new_dist = max(90.0, min(950.0, dist * float(factor)))
+            ratio = new_dist / (dist if dist > 0 else 1.0)
+            camera.setPosition(Vector(pos.x * ratio, pos.y * ratio, pos.z * ratio))
+            if hasattr(camera, "lookAt"):
+                camera.lookAt(Vector(0, 0, 0))
+            return True
+        except Exception as exc:
+            logger.warning("zoom failed: %s", exc)
+            return False
+
+    def orbit(self, delta_yaw_deg, delta_pitch_deg):
+        # type: (float, float) -> bool
+        return MainThreadDispatcher.run_sync(self._orbit_impl, delta_yaw_deg, delta_pitch_deg)
+
+    def _orbit_impl(self, delta_yaw_deg, delta_pitch_deg):
+        # type: (float, float) -> bool
+        app = self._application()
+        if app is None:
+            return False
+        controller = app.getController()
+        if controller is None:
+            return False
+        camera = controller.getScene().getActiveCamera() if controller.getScene() else None
+        if camera is None:
+            return False
+        try:
+            from UM.Math.Vector import Vector
+            import math
+            pos = camera.getPosition()
+            r = math.sqrt(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z)
+            if r < 10.0:
+                r = 350.0
+            yaw = math.atan2(pos.x, pos.z)
+            pitch = math.asin(max(-0.99, min(0.99, pos.y / r)))
+
+            yaw += math.radians(float(delta_yaw_deg))
+            pitch = max(math.radians(5.0), min(math.radians(85.0), pitch + math.radians(float(delta_pitch_deg))))
+
+            y = r * math.sin(pitch)
+            xz = r * math.cos(pitch)
+            x = xz * math.sin(yaw)
+            z = xz * math.cos(yaw)
+
+            camera.setPosition(Vector(x, y, z))
+            if hasattr(camera, "lookAt"):
+                camera.lookAt(Vector(0, 0, 0))
+            return True
+        except Exception as exc:
+            logger.warning("orbit failed: %s", exc)
             return False
 
     def capture_window_screenshot(self, target_qquick_window, save_path):

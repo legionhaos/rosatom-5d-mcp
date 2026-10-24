@@ -14,7 +14,7 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 
 # Try to import project logger if available, otherwise use standard logging
 try:
-    from utils.logger import get_logger
+    from plugin.utils.logger import get_logger
     logger = get_logger(__name__)
 except Exception:
     logger = logging.getLogger("AgentWorker")
@@ -279,7 +279,7 @@ class AgentWorker(QThread):
 
         logger.debug("Tool call started: %s (%s)", tool_name, call_id)
         self._active_calls[str(call_id)] = str(tool_name)
-        self.toolCallStarted.emit(str(tool_name), str(call_id), args_json)
+        self.toolCallStarted.emit(str(call_id), str(tool_name), args_json)
 
     tool_call_started = on_tool_call_started
 

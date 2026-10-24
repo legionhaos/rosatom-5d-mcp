@@ -1,6 +1,5 @@
 import QtQuick 2.7
 import QtQuick.Controls 1.4
-import QtQuick.Controls.Styles 1.4
 import QtQuick.Layouts 1.1
 import QtQuick.Window 2.2
 
@@ -8,14 +7,13 @@ Window {
     id: root
     objectName: "settingsDialog"
     title: "Настройки подключения LLM API — STE Slicer"
-    width: 560
-    height: 480
-    minimumWidth: 500
-    minimumHeight: 440
+    width: 600
+    height: 520
+    minimumWidth: 540
+    minimumHeight: 480
     color: "#f8fafc"
     flags: Qt.Dialog
 
-    // Safe accessors
     readonly property var activeCtrl: (typeof controller !== "undefined" && controller) ? controller : (typeof chatController !== "undefined" ? chatController : null)
     readonly property var activeMgr: (typeof manager !== "undefined" && manager) ? manager : null
 
@@ -63,27 +61,27 @@ Window {
                 spacing: 10
 
                 Rectangle {
-                    width: 32
-                    height: 32
+                    width: 34
+                    height: 34
                     radius: 8
-                    color: "#e8f0fe"
+                    color: "#eff6ff"
                     Text {
                         anchors.centerIn: parent
                         text: "⚙"
-                        font.pixelSize: 16
-                        color: "#1976d2"
+                        font.pixelSize: 18
+                        color: "#2563eb"
                     }
                 }
 
                 Column {
                     Text {
-                        text: "Настройки LLM API"
-                        color: "#1e293b"
-                        font.pixelSize: 16
+                        text: "Настройки подключения LLM API"
+                        color: "#0f172a"
+                        font.pixelSize: 15
                         font.bold: true
                     }
                     Text {
-                        text: "OpenAI, Ollama, LM Studio, vLLM, OpenRouter"
+                        text: "Совместимо с OpenAI, Ollama, LM Studio, vLLM, DeepSeek"
                         color: "#64748b"
                         font.pixelSize: 11
                     }
@@ -91,13 +89,10 @@ Window {
 
                 Item { Layout.fillWidth: true }
 
-                // =============================================================
-                // PROMINENT CLOSE BUTTON (✕) IN DIALOG HEADER
-                // =============================================================
                 Rectangle {
-                    width: 32
-                    height: 32
-                    radius: 16
+                    width: 30
+                    height: 30
+                    radius: 15
                     color: closeDialogMouse.containsMouse ? "#fee2e2" : "#f1f5f9"
                     border.color: closeDialogMouse.containsMouse ? "#fca5a5" : "#cbd5e1"
                     border.width: 1
@@ -105,7 +100,7 @@ Window {
                     Text {
                         anchors.centerIn: parent
                         text: "✕"
-                        font.pixelSize: 14
+                        font.pixelSize: 12
                         font.bold: true
                         color: closeDialogMouse.containsMouse ? "#ef4444" : "#64748b"
                     }
@@ -123,7 +118,66 @@ Window {
             Rectangle {
                 Layout.fillWidth: true
                 height: 1
-                color: "#e2e8f0"
+                color: "#f1f5f9"
+            }
+
+            // Quick Provider Presets Chips
+            Column {
+                Layout.fillWidth: true
+                spacing: 5
+
+                Text {
+                    text: "Быстрый выбор провайдера:"
+                    color: "#64748b"
+                    font.pixelSize: 11
+                    font.bold: true
+                }
+
+                Flow {
+                    width: parent.width
+                    spacing: 6
+
+                    Repeater {
+                        model: [
+                            { label: "🟣 OpenAI", url: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+                            { label: "🟠 Ollama (Local)", url: "http://localhost:11434/v1", model: "llama3.1" },
+                            { label: "🟢 LM Studio", url: "http://localhost:1234/v1", model: "local-model" },
+                            { label: "🔴 DeepSeek", url: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+                            { label: "🔵 OpenRouter", url: "https://openrouter.ai/api/v1", model: "anthropic/claude-3.5-sonnet" }
+                        ]
+
+                        delegate: Rectangle {
+                            height: 24
+                            radius: 12
+                            color: presetMouse.containsMouse ? "#dbeafe" : "#f1f5f9"
+                            border.color: presetMouse.containsMouse ? "#2563eb" : "#e2e8f0"
+                            border.width: 1
+                            implicitWidth: presetText.width + 16
+
+                            Text {
+                                id: presetText
+                                anchors.centerIn: parent
+                                text: modelData.label
+                                font.pixelSize: 10
+                                color: "#1e293b"
+                            }
+
+                            MouseArea {
+                                id: presetMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    baseUrlInput.text = modelData.url;
+                                    modelNameInput.text = modelData.model;
+                                    if (modelData.label.indexOf("Local") !== -1 || modelData.label.indexOf("LM Studio") !== -1) {
+                                        if (!apiKeyInput.text) apiKeyInput.text = "dummy";
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Field: Base URL
@@ -133,7 +187,7 @@ Window {
 
                 Text {
                     text: "Base URL (эндпоинт API):"
-                    color: "#1e293b"
+                    color: "#0f172a"
                     font.pixelSize: 12
                     font.bold: true
                 }
@@ -147,7 +201,7 @@ Window {
                 }
 
                 Text {
-                    text: "Указывайте без /chat/completions на конце."
+                    text: "Без /chat/completions на конце"
                     color: "#94a3b8"
                     font.pixelSize: 10
                 }
@@ -160,7 +214,7 @@ Window {
 
                 Text {
                     text: "API Key (ключ авторизации):"
-                    color: "#1e293b"
+                    color: "#0f172a"
                     font.pixelSize: 12
                     font.bold: true
                 }
@@ -212,7 +266,7 @@ Window {
 
                 Text {
                     text: "Название модели:"
-                    color: "#1e293b"
+                    color: "#0f172a"
                     font.pixelSize: 12
                     font.bold: true
                 }
@@ -220,7 +274,7 @@ Window {
                 TextField {
                     id: modelNameInput
                     width: parent.width
-                    placeholderText: "gpt-4o-mini, qwen2.5:7b, llama3.1..."
+                    placeholderText: "gpt-4o-mini, llama3.1, deepseek-chat..."
                     text: activeCtrl ? activeCtrl.modelName : ""
                     font.pixelSize: 12
                 }
@@ -263,11 +317,11 @@ Window {
 
                 // Check Connection Button
                 Rectangle {
-                    width: 170
+                    width: 174
                     height: 36
                     radius: 8
-                    color: checkMouse.containsMouse ? "#e8f0fe" : "#f1f5f9"
-                    border.color: checkMouse.containsMouse ? "#1976d2" : "#cbd5e1"
+                    color: checkMouse.containsMouse ? "#eff6ff" : "#f1f5f9"
+                    border.color: checkMouse.containsMouse ? "#2563eb" : "#cbd5e1"
                     border.width: 1
 
                     Row {
@@ -278,7 +332,7 @@ Window {
                             text: "Проверить связь"
                             font.pixelSize: 12
                             font.bold: true
-                            color: checkMouse.containsMouse ? "#1976d2" : "#1e293b"
+                            color: checkMouse.containsMouse ? "#2563eb" : "#1e293b"
                         }
                     }
 
@@ -325,10 +379,10 @@ Window {
 
                 // Save Button
                 Rectangle {
-                    width: 110
+                    width: 120
                     height: 36
                     radius: 8
-                    color: saveDialogMouse.containsMouse ? "#1565c0" : "#1976d2"
+                    color: saveDialogMouse.containsMouse ? "#1d4ed8" : "#2563eb"
 
                     Row {
                         anchors.centerIn: parent

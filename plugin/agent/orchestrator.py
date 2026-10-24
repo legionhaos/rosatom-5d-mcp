@@ -14,7 +14,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 
 # Try to import project logger if available, otherwise use standard logging
 try:
-    from utils.logger import get_logger
+    from plugin.utils.logger import get_logger
     logger = get_logger(__name__)
 except Exception:
     logger = logging.getLogger("AgentOrchestrator")
@@ -168,7 +168,14 @@ class AgentOrchestrator(object):
                          iteration, self.max_iterations, len(messages))
 
             try:
-                llm_response = self.llm_client.chat_completion(messages, tools=tools_schema)
+                llm_response = self.llm_client.chat_completion(
+                    messages,
+                    tools=tools_schema,
+                    tool_choice=(
+                        {"type": "function", "function": {"name": "analyze_mesh_geometry"}}
+                        if not executed_tools.get("analyze_mesh_geometry") else "auto"
+                    )
+                )
             except Exception as e:
                 logger.exception("LLM chat_completion failed on iteration %d: %s", iteration, e)
                 err_text = (
@@ -205,7 +212,7 @@ class AgentOrchestrator(object):
                     status = "ok"
                     try:
                         tool_result = self.mcp_server.call_tool(tool_name, args_json)
-                        if isinstance(tool_result, dict) and tool_result.get("status") == "error":
+                        if isinstance(tool_result, dict) and str(tool_result.get("status", "")).lower() in ("error", "failed"):
                             status = "error"
                     except Exception as e:
                         logger.exception("Error executing MCP tool '%s': %s", tool_name, e)
@@ -213,6 +220,11 @@ class AgentOrchestrator(object):
                         tool_result = {"status": "error", "error": str(e)}
 
                     duration_ms = int((time.time() - start_time) * 1000)
+                    try:
+                        from plugin.utils.logger import STEPluginLogger
+                        STEPluginLogger.log_mcp_call(tool_name, args_json, tool_result, duration_ms)
+                    except Exception:
+                        logger.debug("MCP audit logging failed for '%s'.", tool_name, exc_info=True)
                     summary = self._create_tool_summary(tool_name, tool_result)
 
                     # Signal UI: tool call finished
@@ -226,6 +238,17 @@ class AgentOrchestrator(object):
                 continue
 
             else:
+                # Do not accept a final answer before geometry analysis. Some providers
+                # ignore tool_choice, so explicitly request the first mandatory step.
+                if tools_schema and not executed_tools.get("analyze_mesh_geometry"):
+                    logger.warning("LLM returned text before mandatory geometry analysis.")
+                    self.context_mgr.add_assistant_message(llm_response.content or "")
+                    self.context_mgr.add_user_turn(
+                        "Выполни обязательный первый MCP-вызов analyze_mesh_geometry сейчас. "
+                        "Не отвечай текстом и используй текущую модель сцены, если file_path не указан."
+                    )
+                    continue
+
                 # No tool calls: final engineering answer received
                 final_answer = llm_response.content or ""
                 logger.info("LLM returned final response on iteration %d (%d chars)",
@@ -268,22 +291,22 @@ class AgentOrchestrator(object):
         active slicer snapshot, and text parsing fallbacks.
         """
         card = {
-            "mode": "5D",
-            "profile": "5D_structural",
-            "material": "PA6-CF",
-            "layer_height_mm": 0.2,
-            "wall_line_count": 4,
-            "infill_density_pct": 50,
-            "infill_pattern": "gyroid",
-            "print_temperature_c": 275,
-            "bed_temperature_c": 90,
-            "fan_speed_pct": 0,
-            "support_enabled": False,
-            "rotation_deg": [0.0, 0.0, 0.0],
-            "print_time_formatted": "1 ч 10 мин",
-            "material_weight_g": 52.4,
-            "filament_length_m": 16.8,
-            "status": "ready_to_print"
+            "mode": "",
+            "profile": "",
+            "material": "",
+            "layer_height_mm": None,
+            "wall_line_count": None,
+            "infill_density_pct": None,
+            "infill_pattern": "",
+            "print_temperature_c": None,
+            "bed_temperature_c": None,
+            "fan_speed_pct": None,
+            "support_enabled": None,
+            "rotation_deg": None,
+            "print_time_formatted": "",
+            "material_weight_g": None,
+            "filament_length_m": None,
+            "status": "recommendation"
         }
 
         # 1. Overlay from initial snapshot
@@ -308,8 +331,8 @@ class AgentOrchestrator(object):
                 card["mode"] = sel_tool["mode"]
             if sel_tool.get("profile"):
                 card["profile"] = sel_tool["profile"]
-            if sel_tool.get("material"):
-                card["material"] = sel_tool["material"]
+            if sel_tool.get("material") or sel_tool.get("applied_material"):
+                card["material"] = sel_tool.get("applied_material") or sel_tool.get("material")
 
         # 3. Overlay from modify_scene_and_parameters tool result
         mod_tool = executed_tools.get("modify_scene_and_parameters") or {}
@@ -354,23 +377,29 @@ class AgentOrchestrator(object):
             return "Ошибка: {0}".format(result.get("error", "сбой выполнения"))
 
         if tool_name == "analyze_mesh_geometry":
-            dims = result.get("dimensions_mm", [0, 0, 0])
-            mode = result.get("recommended_mode", "5D")
+            metrics = result.get("geometry_metrics") or {}
+            bounds = metrics.get("bounding_box_mm") or {}
+            dims = [bounds.get("dx", 0), bounds.get("dy", 0), bounds.get("dz", 0)]
+            mode = (result.get("overhang_evaluation") or {}).get("recommended_mode", "5D")
             return "Геометрия проанализирована: габариты {0}x{1}x{2} мм, рекомендован режим {3}.".format(
                 dims[0], dims[1], dims[2], mode
             )
 
         elif tool_name == "select_print_mode_and_profile":
-            return "Выбран режим {0}, профиль '{1}', материал '{2}'.".format(
-                result.get("mode", "5D"),
-                result.get("profile", "5D_structural"),
-                result.get("material", "PA6-CF")
+            if str(result.get("status", "")).lower() in ("error", "failed"):
+                return "Ошибка выбора профиля: {0}".format(result.get("error") or result.get("message") or "неизвестная ошибка")
+            applied_material = result.get("applied_material")
+            applied_profile = result.get("applied_profile")
+            selected_material = applied_material or "материал не изменён"
+            selected_profile = applied_profile or "профиль не изменён"
+            return "Режим {0}; материал: {1}; профиль качества: {2}.".format(
+                result.get("mode", "не изменён"), selected_material, selected_profile
             )
 
         elif tool_name == "modify_scene_and_parameters":
-            rot = result.get("applied_rotation_deg", [0, 0, 0])
-            params = result.get("applied_parameters") or {}
-            temp = params.get("print_temperature_c", 275)
+            rot = result.get("applied_rotation_deg", result.get("applied_rotation_euler_deg", [0, 0, 0]))
+            params = result.get("applied_parameters") or result.get("applied_overrides") or {}
+            temp = params.get("print_temperature_c", params.get("material_print_temperature", 275))
             walls = params.get("wall_line_count", 4)
             return "Применена ориентация (X:{0}°, Y:{1}°, Z:{2}°), температура {3}°C, {4} стенки.".format(
                 rot[0], rot[1], rot[2], temp, walls

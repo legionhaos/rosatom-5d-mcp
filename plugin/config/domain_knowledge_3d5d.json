@@ -91,6 +91,7 @@
       "features": "Высокая термостойкость до 100°C, подвержен усадке. Требует закрытой камеры и минимального обдува."
     },
     "PA6-CF": {
+      "aliases": ["Carbon Nylon", "Carbon Fiber Nylon", "PA6 CF", "PA6-CF"],
       "name": "PA6-CF / Carbon Nylon (Полиамид с углеволокном)",
       "type": "Высокопрочный композитный конструкционный материал",
       "nozzle_temp_range": [260, 290],
@@ -103,6 +104,21 @@
       "heat_deflection_temp_c": 160,
       "density_g_cm3": 1.18,
       "features": "Экстремальная жесткость, прочность, термостойкость до 160°C и износостойкость. Оптимален для 5D-печати шестерен и нагруженных узлов."
+    },
+    "ASA": {
+      "aliases": ["Acrylonitrile Styrene Acrylate"],
+      "name": "ASA (Акрилонитрил-стирол-акрилат)",
+      "type": "Атмосферостойкий конструкционный термопласт",
+      "nozzle_temp_range": [240, 265],
+      "nozzle_temp_recommended": 250,
+      "bed_temp_range": [90, 110],
+      "bed_temp_recommended": 100,
+      "fan_speed": 10,
+      "print_speed": [35, 55],
+      "tensile_strength_mpa": 45,
+      "heat_deflection_temp_c": 95,
+      "density_g_cm3": 1.07,
+      "features": "Стойкость к ультрафиолету и погодным условиям; печатать в закрытой камере с контролем усадки."
     },
     "PA12": {
       "name": "PA12 (Нейлон 12)",

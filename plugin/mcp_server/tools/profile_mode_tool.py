@@ -85,7 +85,7 @@ class ProfileModeTool(BaseMCPTool):
             },
             "material": {
                 "type": "string",
-                "description": "Имя материала филамента (PLA, PETG, ABS, TPU, PA6-CF и т.д.)."
+                "description": "Имя материала из STE Slicer. Поддерживаются точные имена и алиасы: PA6-CF = Carbon Nylon = Carbon Fiber Nylon; также PLA, PETG, ABS, TPU, PA12, ASA."
             },
             "profile": {
                 "type": "string",
@@ -127,14 +127,17 @@ class ProfileModeTool(BaseMCPTool):
             material_spec = self._lookup_material_spec(material) if material else None
             mode_spec = self._lookup_mode_spec(mode)
 
+            warnings = result.get("warnings", [])
+            material_not_applied = bool(material and not result.get("applied_material"))
+            profile_not_applied = bool(profile and not result.get("applied_profile"))
             response = {
-                "status": "SUCCESS",
+                "status": "ERROR" if material_not_applied or profile_not_applied else "SUCCESS",
                 "mode": mode,
-                "mode_info": mode_spec,
                 "applied_material": result.get("applied_material"),
                 "applied_profile": result.get("applied_profile"),
-                "material_spec": material_spec,
-                "warnings": result.get("warnings", [])
+                "material_spec": material_spec if result.get("applied_material") else None,
+                "warnings": warnings,
+                "error": "; ".join(warnings) if material_not_applied or profile_not_applied else ""
             }
             return response
         except Exception as exc:
@@ -160,10 +163,19 @@ class ProfileModeTool(BaseMCPTool):
 
     def _apply_mode_and_profile(self, mode, material, profile):
         # type: (str, Optional[str], Optional[str]) -> Dict[str, Any]
-        from cura.CuraApplication import CuraApplication
-
         warnings = []
-        app = CuraApplication.getInstance()
+        app = None
+        try:
+            from UM.Application import Application
+            app = Application.getInstance()
+        except Exception:
+            pass
+        if app is None:
+            try:
+                from cura.CuraApplication import CuraApplication
+                app = CuraApplication.getInstance()
+            except Exception as exc:
+                raise SceneError("Не удалось получить экземпляр приложения: {0}".format(exc))
         if not app:
             raise SceneError("CuraApplication не инициализировано.")
 
@@ -319,16 +331,28 @@ class ProfileModeTool(BaseMCPTool):
                     all_materials = finder(type="material")
                 except Exception:
                     all_materials = []
-                upper = material.upper()
+                requested = self._normalize_material_name(material)
                 for cont in all_materials or []:
-                    name = str(getattr(cont, "getName", lambda: "")()).upper()
-                    cid = str(getattr(cont, "getId", lambda: "")()).upper()
-                    if upper in name or upper in cid:
+                    name = str(getattr(cont, "getName", lambda: "")())
+                    cid = str(getattr(cont, "getId", lambda: "")())
+                    candidate = self._normalize_material_name(name + " " + cid)
+                    if requested == candidate or requested in candidate or candidate in requested:
                         candidates.append(cont)
                 if candidates:
                     break
 
         return candidates
+
+    @staticmethod
+    def _normalize_material_name(value):
+        """Normalize aliases and vendor naming before matching material containers."""
+        text = str(value or "").lower().replace("_", "-")
+        text = text.replace("carbon nylon", "pa6-cf")
+        text = text.replace("carbon fiber nylon", "pa6-cf")
+        text = text.replace("carbon-fiber nylon", "pa6-cf")
+        text = text.replace("polyamide 6 cf", "pa6-cf")
+        text = text.replace("polyamide6-cf", "pa6-cf")
+        return "".join(ch for ch in text if ch.isalnum() or ch == "-")
 
     def _find_quality_container(self, app, global_stack, profile):
         # type: (Any, Any, str) -> Any

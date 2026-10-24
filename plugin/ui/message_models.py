@@ -221,6 +221,10 @@ class AttachmentListModel(_ListModel):
 
 
 class ToolLogModel(_ListModel):
+    @property
+    def items(self):
+        return [dict(item) for item in self._items]
+
     _roles = {
         "toolName": Qt.UserRole + 1,
         "label": Qt.UserRole + 2,

@@ -264,7 +264,8 @@ class FallbackToolCallParser(object):
 
         return tool_calls, cleaned_content
 
-    def _normalize_arguments_json(self, raw_args):
+    @staticmethod
+    def _normalize_arguments_json(raw_args):
         # type: (Any) -> str
         """Normalizes any argument representation into a valid JSON string."""
         if raw_args is None:
@@ -792,6 +793,31 @@ class OpenAICompatibleClient(object):
             usage=usage
         )
 
+    @staticmethod
+    def _normalize_arguments_json(raw_args):
+        """Normalize LLM tool arguments to one valid JSON object string."""
+        if raw_args is None:
+            return "{}"
+        if isinstance(raw_args, dict):
+            return json.dumps(raw_args, ensure_ascii=False)
+        if isinstance(raw_args, list):
+            return json.dumps({"input": raw_args}, ensure_ascii=False)
+        if isinstance(raw_args, str):
+            trimmed = raw_args.strip()
+            if not trimmed:
+                return "{}"
+            try:
+                parsed = json.loads(trimmed)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(trimmed)
+                except Exception:
+                    return json.dumps({"input": trimmed}, ensure_ascii=False)
+            if isinstance(parsed, dict):
+                return json.dumps(parsed, ensure_ascii=False)
+            return json.dumps({"input": parsed}, ensure_ascii=False)
+        return json.dumps({"input": raw_args}, ensure_ascii=False)
+
     def _parse_native_tool_call(self, tc):
         # type: (Any) -> Optional[ToolCallItem]
         """Converts an OpenAI tool_call dict into a ToolCallItem."""
@@ -806,12 +832,7 @@ class OpenAICompatibleClient(object):
             name = tc.get("name", "")
             raw_args = tc.get("arguments", "{}")
 
-        if isinstance(raw_args, (dict, list)):
-            args_json = json.dumps(raw_args, ensure_ascii=False)
-        elif isinstance(raw_args, str):
-            args_json = raw_args.strip() or "{}"
-        else:
-            args_json = json.dumps(raw_args, ensure_ascii=False) if raw_args is not None else "{}"
+        args_json = self._normalize_arguments_json(raw_args)
 
         return ToolCallItem(id=call_id, name=name, arguments_json=args_json)
 

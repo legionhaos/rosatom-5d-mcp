@@ -152,7 +152,8 @@ class SystemPromptBuilder(object):
             "   - ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ: Сопоставление результатов геометрического анализа с правилами выбора\n"
             "     технологии. Определение режима (\"5D\" для многоосевой прочности и исключения поддержек,\n"
             "     либо \"3D\" для плоских призматических деталей), выбор профиля слайсинга (например, 5D_structural,\n"
-            "     5D_precision, 3D_standard) и совместимого материала (PA6-CF, PETG, PLA, ABS, TPU).\n\n"
+            "     5D_precision, 3D_standard) и совместимого материала из snapshot.available_materials;\n"
+            "     если доступных материалов нет, не утверждай, что материал применен — сообщи об этом.\n\n"
             "3. modify_scene_and_parameters\n"
             "   - ЦЕЛЬ: Применить оптимальную пространственную ориентацию детали и задать технологические параметры.\n"
             "   - ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ: \n"
@@ -283,11 +284,9 @@ class SystemPromptBuilder(object):
             snapshot.get("scene_objects") or
             []
         )
-        avail_materials = (
-            snapshot.get("available_materials") or
-            snapshot.get("materials") or
-            list(self.knowledge_base.get("materials_catalog", {}).keys())
-        )
+        # Only list materials actually reported by the running slicer. The
+        # knowledge catalog is technical reference, not evidence of installation.
+        avail_materials = snapshot.get("available_materials") or snapshot.get("materials") or []
         avail_profiles = (
             snapshot.get("available_profiles") or
             snapshot.get("profiles") or
@@ -345,7 +344,7 @@ class SystemPromptBuilder(object):
             models_block = "  (В текущей сцене нет загруженных деталей. Ожидается загрузка 3D-модели пользователем)"
 
         # 3. Available materials & profiles
-        mat_str = ", ".join(str(m) for m in avail_materials) if avail_materials else "PA6-CF, PETG, PLA, ABS, TPU"
+        mat_str = ", ".join(str(m) for m in avail_materials) if avail_materials else "материалы не удалось определить в слайсере"
         prof_str = ", ".join(str(p) for p in avail_profiles) if avail_profiles else "5D_structural, 5D_precision, 3D_standard"
 
         # 4. Active settings

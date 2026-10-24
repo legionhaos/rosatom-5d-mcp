@@ -96,12 +96,24 @@ class STEPluginLogger(object):
                         os.path.join(directory, _LOG_NAME), maxBytes=2 * 1024 * 1024,
                         backupCount=3, encoding="utf-8")
                     handler.setFormatter(logging.Formatter(
-                        "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+                        "%(asctime)s [%(levelname)s] %(name)s %(message)s", "%Y-%m-%d %H:%M:%S"))
                     logger.addHandler(handler)
                     cls._log_dir = directory
                     break
-                except (OSError, IOError):
+                except (OSError, IOError) as exc:
+                    try:
+                        print("STE AI logger cannot write to %s: %s" % (directory, exc))
+                    except Exception:
+                        pass
                     continue
+            if not logger.handlers:
+                try:
+                    handler = logging.StreamHandler()
+                    handler.setFormatter(logging.Formatter(
+                        "%(asctime)s [%(levelname)s] %(name)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+                    logger.addHandler(handler)
+                except Exception:
+                    pass
             cls._file_logger = logger
             return logger
 
@@ -126,6 +138,14 @@ class STEPluginLogger(object):
     def _emit(cls, level, tag, msg, exc_info=False):
         msg = mask_secrets(str(msg))
         line = "[%s] %s" % (tag, msg)
+        traceback_text = ""
+        if exc_info:
+            import traceback
+            traceback_text = mask_secrets(traceback.format_exc())
+            if traceback_text.strip() == "NoneType: None":
+                traceback_text = ""
+            elif traceback_text:
+                line += "\n" + traceback_text.rstrip()
         # 1) UM.Logger
         if _UMLogger is not None:
             try:
@@ -140,9 +160,12 @@ class STEPluginLogger(object):
             fl = cls._ensure_file_logger()
             py_level = {"d": logging.DEBUG, "i": logging.INFO, "w": logging.WARNING,
                         "e": logging.ERROR}.get(level, logging.INFO)
-            fl.log(py_level, line, exc_info=bool(exc_info))
-        except Exception:
-            pass
+            fl.log(py_level, line)
+        except Exception as exc:
+            try:
+                print("STE AI logger write failed: %s" % exc)
+            except Exception:
+                pass
         # 3) UI
         with cls._lock:
             listeners = list(cls._ui_listeners)
@@ -170,6 +193,12 @@ class STEPluginLogger(object):
         """exc_info=True — приложить трассировку текущего исключения."""
         cls._emit("e", tag, msg, exc_info=exc_info)
 
+    @classmethod
+    def exception(cls, msg, tag="STE_AI"):
+        # type: (str, str) -> None
+        """Записывает сообщение и traceback текущего исключения."""
+        cls._emit("e", tag, msg, exc_info=True)
+
     # ------------------------------ аудит MCP ----------------------------- #
     @classmethod
     def log_mcp_call(cls, tool_name, args, result, duration_ms):
@@ -193,9 +222,16 @@ class STEPluginLogger(object):
                 path = os.path.join(cls.get_log_dir(), _AUDIT_NAME)
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(text + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            cls.exception("MCP audit write failed: %s" % exc, tag="MCP_LOG")
         cls.info("MCP %s -> %s (%d ms)" % (tool_name, status, duration_ms), tag="MCP")
+        if isinstance(result, dict) and str(status).lower() in ("error", "failed"):
+            error_text = result.get("error") or result.get("message") or result
+            cls.error("MCP %s failed: %s" % (tool_name, json.dumps(_sanitize(error_text), ensure_ascii=False, default=str)),
+                      exc_info=False, tag="MCP")
+            if result.get("traceback"):
+                cls.error("MCP %s traceback:\n%s" % (tool_name, result["traceback"]),
+                          exc_info=False, tag="MCP")
 
 
 def get_logger(name=None):

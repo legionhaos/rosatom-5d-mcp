@@ -1,19 +1,20 @@
 import QtQuick 2.7
 
-// Step status icon: "wait" (empty circle), "active" (spinning arc), "done" (check mark).
 Item {
     id: root
-    property string status: "wait"
-    property string activeColor: "#147db8"
-    property string doneColor: "#159a68"
-    property string idleColor: "#a5b4be"
-    width: 18
-    height: 18
+    property string status: "wait" // "wait", "active", "done", "error"
+    property color activeColor: "#2563eb"
+    property color doneColor: "#10b981"
+    property color idleColor: "#94a3b8"
+    property color errorColor: "#ef4444"
+    width: 20
+    height: 20
 
+    // Wait state
     Rectangle {
         anchors.centerIn: parent
-        width: 11
-        height: 11
+        width: 12
+        height: 12
         radius: 6
         color: "transparent"
         border.color: root.idleColor
@@ -21,37 +22,74 @@ Item {
         visible: root.status === "wait"
     }
 
-    Text {
+    // Done state
+    Rectangle {
         anchors.centerIn: parent
-        text: "✓"
-        color: root.doneColor
-        font.pixelSize: 14
-        font.bold: true
+        width: 18
+        height: 18
+        radius: 9
+        color: "#ecfdf5"
+        border.color: root.doneColor
+        border.width: 1.5
         visible: root.status === "done"
+
+        Text {
+            anchors.centerIn: parent
+            text: "✓"
+            color: root.doneColor
+            font.pixelSize: 11
+            font.bold: true
+        }
     }
 
+    // Error state
+    Rectangle {
+        anchors.centerIn: parent
+        width: 18
+        height: 18
+        radius: 9
+        color: "#fef2f2"
+        border.color: root.errorColor
+        border.width: 1.5
+        visible: root.status === "error" || root.status === "err"
+
+        Text {
+            anchors.centerIn: parent
+            text: "!"
+            color: root.errorColor
+            font.pixelSize: 11
+            font.bold: true
+        }
+    }
+
+    // Active spinner
     Canvas {
         id: spinner
         anchors.fill: parent
         visible: root.status === "active"
         onPaint: {
-            var ctx = getContext("2d")
-            ctx.reset()
-            ctx.lineWidth = 2
-            ctx.lineCap = "round"
-            ctx.strokeStyle = "#dbe8ef"
-            ctx.beginPath()
-            ctx.arc(width / 2, height / 2, width / 2 - 2, 0, 2 * Math.PI)
-            ctx.stroke()
-            ctx.strokeStyle = root.activeColor
-            ctx.beginPath()
-            ctx.arc(width / 2, height / 2, width / 2 - 2, 0, Math.PI * 1.3)
-            ctx.stroke()
+            var ctx = getContext("2d");
+            ctx.reset();
+            ctx.lineWidth = 2.5;
+            ctx.lineCap = "round";
+
+            // Track
+            ctx.strokeStyle = "#e2e8f0";
+            ctx.beginPath();
+            ctx.arc(width / 2, height / 2, width / 2 - 3, 0, 2 * Math.PI);
+            ctx.stroke();
+
+            // Head
+            ctx.strokeStyle = root.activeColor;
+            ctx.beginPath();
+            ctx.arc(width / 2, height / 2, width / 2 - 3, 0, Math.PI * 1.2);
+            ctx.stroke();
         }
+
         RotationAnimation on rotation {
             from: 0
             to: 360
-            duration: 900
+            duration: 850
             loops: Animation.Infinite
             running: spinner.visible
         }
