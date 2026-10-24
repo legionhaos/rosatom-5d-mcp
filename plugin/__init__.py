@@ -9,63 +9,50 @@ Entry point for Uranium PluginRegistry:
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import json
 import os
 import sys
-from typing import Any, Dict
+import types
 
-# Гарантируем присутствие корня плагина и проекта в sys.path для надежности импортов
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 
-_parent_dir = os.path.dirname(_current_dir)
-if _parent_dir not in sys.path:
-    sys.path.insert(0, _parent_dir)
+# Когда плагин загружается в STE Slicer под именем STEAIAssistant (или любым другим),
+# регистрируем модуль 'plugin' в sys.modules, чтобы все внутренние вызовы
+# (from plugin.xxx import yyy) прозрачно находили компоненты внутри этой папки.
+if "plugin" not in sys.modules:
+    plugin_mod = types.ModuleType("plugin")
+    plugin_mod.__path__ = [_current_dir]
+    plugin_mod.__file__ = os.path.join(_current_dir, "__init__.py")
+    sys.modules["plugin"] = plugin_mod
+elif hasattr(sys.modules["plugin"], "__path__") and _current_dir not in sys.modules["plugin"].__path__:
+    sys.modules["plugin"].__path__.insert(0, _current_dir)
 
-from plugin.slicer_bridge.extension import STEAIExtension
+# Относительный импорт главного класса расширения
+from .slicer_bridge.extension import STEAIExtension
 
 
 def getMetaData():
-    # type: () -> Dict[str, Any]
+    # type: () -> dict
     """
-    Возвращает словарь метаданных плагина для Uranium PluginRegistry.
-    Если рядом лежит plugin.json, считывает информацию из него.
+    Метаданные плагина. Метаданные автоматически считываются Uranium из plugin.json.
     """
-    json_path = os.path.join(_current_dir, "plugin.json")
-    if os.path.isfile(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data
-        except Exception:
-            pass
-
-    return {
-        "name": "STE AI 3D/5D Print Assistant",
-        "author": "Hackathon Team",
-        "version": "1.0.0",
-        "description": "Интеллектуальный сервис автоподбора параметров FDM 3D/5D-печати с чат-ботом и MCP-инструментами",
-        "api": 5,
-        "supported_sdk_versions": ["4.0.0", "5.0.0", "6.0.0"],
-        "plugin": {}
-    }
+    return {}
 
 
 def register(app):
-    # type: (Any) -> Dict[str, Any]
+    # type: (object) -> dict
     """
-    Главная точка инициализации расширения в Uranium/Cura.
+    Главная точка инициализации расширения в Uranium/STE Slicer.
 
     Args:
-        app: Экземпляр CuraApplication.
+        app: Экземпляр SteSlicerApplication / CuraApplication.
 
     Returns:
-        Dict[str, Any]: Словарь зарегистрированных объектов расширения.
+        dict: Словарь с зарегистрированным расширением {"extension": STEAIExtension(app)}.
     """
-    extension = STEAIExtension(application=app)
     return {
-        "extension": extension
+        "extension": STEAIExtension(application=app)
     }
 
 

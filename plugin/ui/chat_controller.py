@@ -67,6 +67,7 @@ class ChatController(QObject):
     responseReady = pyqtSignal(str)
     taskFailed = pyqtSignal(str)
     settingsSaved = pyqtSignal()
+    connectionCheckFinished = pyqtSignal(bool, str)
     screenshotRequested = pyqtSignal()
     exportRequested = pyqtSignal(str)
 
@@ -79,11 +80,12 @@ class ChatController(QObject):
     slicingProgressChanged = pyqtSignal()
     printResultChanged = pyqtSignal()
 
-    def __init__(self, agent_backend=None, slicer_bridge=None, settings_store=None, parent=None):
+    def __init__(self, agent_backend=None, slicer_bridge=None, settings_store=None, extension=None, parent=None):
         super().__init__(parent)
         self._agent = agent_backend
         self._slicer = slicer_bridge
         self._settings = settings_store
+        self._extension = extension
         self._messages = MessageListModel(self)
         self._attachments = AttachmentListModel(self)
         self._tools = ToolLogModel(self)
@@ -119,6 +121,13 @@ class ChatController(QObject):
     def connected(self):
         return self._connected
 
+    @pyqtSlot(bool)
+    def setConnected(self, value):
+        val = bool(value)
+        if self._connected != val:
+            self._connected = val
+            self.connectedChanged.emit()
+
     @pyqtProperty(str, notify=printerChanged)
     def printerName(self):
         return self._printer
@@ -146,6 +155,24 @@ class ChatController(QObject):
     @pyqtProperty(str, notify=printResultChanged)
     def materialUsage(self):
         return self._material_usage
+
+    @pyqtProperty(str, notify=settingsSaved)
+    def baseUrl(self):
+        if self._settings is not None:
+            return str(self._settings.get("api_url") or "")
+        return ""
+
+    @pyqtProperty(str, notify=settingsSaved)
+    def apiKey(self):
+        if self._settings is not None:
+            return str(self._settings.get("api_key") or "")
+        return ""
+
+    @pyqtProperty(str, notify=settingsSaved)
+    def modelName(self):
+        if self._settings is not None:
+            return str(self._settings.get("model_name") or "")
+        return ""
 
     def _set_busy(self, value):
         value = bool(value)
@@ -245,6 +272,7 @@ class ChatController(QObject):
         self._attachments.clear()
         self._model_count = 0
         self.modelCountChanged.emit()
+        self.messageAdded.emit()
 
     @pyqtSlot()
     def cancelRequest(self):
@@ -261,7 +289,8 @@ class ChatController(QObject):
 
     @pyqtSlot()
     def openSettings(self):
-        pass
+        if self._extension is not None and hasattr(self._extension, "showSettingsDialog"):
+            self._extension.showSettingsDialog()
 
     @pyqtSlot(str, str, str)
     def saveSettings(self, base_url, api_key, model):
@@ -284,29 +313,41 @@ class ChatController(QObject):
 
     @pyqtSlot(str, str, str)
     def checkConnection(self, base_url, api_key, model):
-        """Ask the injected agent to validate provider settings.
-
-        The actual network request belongs to AgentWorker. The UI only shows a
-        clear status when the backend does not expose a check method.
-        """
+        """Ask the injected agent to validate provider settings."""
         if self._agent is None:
-            self._fail("Agent backend не подключён: проверить соединение невозможно.")
+            msg = "Agent backend не подключён: проверить соединение невозможно."
+            self._fail(msg)
+            self.connectionCheckFinished.emit(False, msg)
             return
         checker = getattr(self._agent, "check_connection", None)
         if checker is None:
             checker = getattr(self._agent, "checkConnection", None)
         if checker is None:
-            self._fail("Agent backend не предоставляет check_connection().")
+            msg = "Agent backend не предоставляет check_connection()."
+            self._fail(msg)
+            self.connectionCheckFinished.emit(False, msg)
             return
         try:
-            result = checker(base_url, api_key, model)
-            if result is False:
-                self._fail("Не удалось подключиться к LLM API.")
+            res = checker(base_url, api_key, model)
+            if isinstance(res, tuple):
+                ok, msg = res[0], res[1]
+            elif isinstance(res, bool):
+                ok = res
+                msg = "Соединение с LLM API проверено." if ok else "Не удалось подключиться к LLM API."
             else:
-                self._messages.append_system("Соединение с LLM API проверено.", self._now(), "ok")
+                ok, msg = bool(res), str(res)
+
+            if not ok:
+                self._fail(msg)
+                self.connectionCheckFinished.emit(False, msg)
+            else:
+                self._messages.append_system(msg, self._now(), "ok")
                 self.messageAdded.emit()
+                self.connectionCheckFinished.emit(True, msg)
         except Exception as exc:
-            self._fail("Ошибка проверки LLM API: {0}".format(exc))
+            err = "Ошибка проверки LLM API: {0}".format(exc)
+            self._fail(err)
+            self.connectionCheckFinished.emit(False, err)
 
     @pyqtSlot(str)
     def exportResult(self, model_name):
@@ -328,7 +369,17 @@ class ChatController(QObject):
 
     @pyqtSlot(str, str, object)
     def onToolCallStarted(self, tool_name, label, arguments=None):
-        args = json.dumps(arguments or {}, ensure_ascii=False, indent=2)
+        args_dict = arguments if isinstance(arguments, dict) else {}
+        if isinstance(arguments, str):
+            try:
+                args_dict = json.loads(arguments)
+            except Exception:
+                args_dict = {}
+        if "mode" in args_dict:
+            self.setPrintMode(str(args_dict["mode"]))
+        if "material" in args_dict:
+            self.setMaterial(str(args_dict["material"]))
+        args = json.dumps(args_dict or arguments or {}, ensure_ascii=False, indent=2)
         row = self._tools.append_call(tool_name, label, args, "pending")
         self._active_tools[tool_name] = row
         self._messages.append_tool(tool_name, label, args, "", "pending", 0)
@@ -337,15 +388,39 @@ class ChatController(QObject):
 
     @pyqtSlot(str, str, object, int)
     def onToolCallFinished(self, tool_name, status, result=None, duration_ms=0):
+        res_dict = result if isinstance(result, dict) else {}
+        if isinstance(result, str):
+            try:
+                res_dict = json.loads(result)
+            except Exception:
+                res_dict = {}
+        if "print_time" in res_dict or "print_time_formatted" in res_dict:
+            pt = str(res_dict.get("print_time_formatted") or res_dict.get("print_time") or "")
+            mu = str(res_dict.get("material_weight_g") or res_dict.get("material_usage") or "")
+            self.setPrintResult(pt, mu)
+        if "mode" in res_dict:
+            self.setPrintMode(str(res_dict["mode"]))
+        if "material" in res_dict:
+            self.setMaterial(str(res_dict["material"]))
         result_text = json.dumps(result or {}, ensure_ascii=False, indent=2) if not isinstance(result, str) else result
         row = self._active_tools.pop(tool_name, -1)
         self._tools.finish_call(row, status.lower(), result_text, duration_ms)
+        self._messages.update_tool(tool_name, status.lower(), result_text, duration_ms)
         self.toolFinished.emit(tool_name, status)
         self.messageAdded.emit()
 
     @pyqtSlot(object)
     def onAgentResponse(self, response):
-        text = response if isinstance(response, str) else response.get("text", "")
+        text = response if isinstance(response, str) else (response.get("text") or response.get("content") or "")
+        summary = response.get("summary") if isinstance(response, dict) else {}
+        if summary and isinstance(summary, dict):
+            if "mode" in summary:
+                self.setPrintMode(str(summary["mode"]))
+            if "material" in summary:
+                self.setMaterial(str(summary["material"]))
+            if "print_time" in summary or "print_time_formatted" in summary:
+                self.setPrintResult(str(summary.get("print_time_formatted") or summary.get("print_time")),
+                                   str(summary.get("material_weight_g") or summary.get("material_usage") or ""))
         if text:
             self._messages.append_assistant(text, self._now())
             self.responseReady.emit(text)

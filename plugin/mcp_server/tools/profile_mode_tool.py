@@ -389,3 +389,7 @@ class ProfileModeTool(BaseMCPTool):
 
 
 __all__ = ["ProfileModeTool"]
+
+
+ProfileAndModeTool = ProfileModeTool
+__all__ = ["ProfileModeTool", "ProfileAndModeTool"]

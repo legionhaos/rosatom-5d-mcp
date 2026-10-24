@@ -182,17 +182,17 @@ class AgentWorker(QThread):
     enqueue_task = send_prompt
 
     def check_connection(self, base_url, api_key, model):
-        # type: (str, str, str) -> bool
+        # type: (str, str, str) -> Tuple[bool, str]
         """Validates connection to the OpenAI-compatible provider."""
         try:
             from plugin.agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
             cfg = LLMConnectionConfig(base_url=base_url, api_key=api_key, model=model, timeout=10.0)
             client = OpenAICompatibleClient(cfg)
-            ok, _ = client.test_connection()
-            return ok
+            ok, msg = client.test_connection()
+            return ok, msg
         except Exception as e:
             logger.warning("check_connection error: %s", e)
-            return False
+            return False, str(e)
 
     checkConnection = check_connection
 

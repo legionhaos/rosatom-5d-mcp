@@ -8,7 +8,7 @@
     python setup.py check_results                      проверяет results/<model>/{project.3mf,result.gcode,chat_*.png}
     python setup.py package --team-name NAME           собирает NAME.zip (plugin/ + results/)
 
-Скрипт самодостаточен и НЕ импортирует код плагина (UM/cura вне слайсера недоступны).
+Скрипт самодостаточен: работает как с setuptools, так и без них (zero-dependency CLI).
 """
 
 import glob
@@ -17,7 +17,16 @@ import shutil
 import sys
 import zipfile
 
-from setuptools import Command, setup
+try:
+    from setuptools import Command, setup
+except ImportError:
+    class Command(object):
+        description = ""
+        user_options = []
+        boolean_options = []
+        def __init__(self, *args, **kwargs):
+            pass
+    setup = None
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_SRC = os.path.join(ROOT, "plugin")
@@ -31,7 +40,7 @@ def detect_ste_slicer_plugin_dir():
     """Пытается найти папку plugins установленного STE Slicer. Возвращает путь или None.
 
     Порядок: переменная окружения STE_SLICER_PLUGIN_DIR -> типичные пути пользователя ->
-    папки установки. Пути ЭВРИСТИЧЕСКИЕ: на машине жюри лучше указать --target явно.
+    папки установки.
     """
     env = os.environ.get("STE_SLICER_PLUGIN_DIR")
     if env and os.path.isdir(env):
@@ -40,20 +49,24 @@ def detect_ste_slicer_plugin_dir():
     patterns = []
     home = os.path.expanduser("~")
     appdata = os.environ.get("APPDATA")
-    if appdata:  # Windows
+    if appdata:  # Windows User Data (не требует прав администратора)
         patterns += [
+            os.path.join(appdata, "steslicer", "*", "plugins"),
+            os.path.join(appdata, "steslicer", "plugins"),
             os.path.join(appdata, "ste_slicer", "*", "plugins"),
             os.path.join(appdata, "ste_slicer", "plugins"),
             os.path.join(appdata, "STE Slicer", "*", "plugins"),
-            os.path.join(appdata, "cura", "3.6", "plugins"),
+            os.path.join(appdata, "cura", "*", "plugins"),
         ]
     for pf in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
         if pf:
             patterns += [
+                os.path.join(pf, "Stereotech STE Slicer*", "plugins"),
                 os.path.join(pf, "STE Slicer*", "plugins"),
                 os.path.join(pf, "STE Slicer*", "lib", "cura", "plugins"),
             ]
     patterns += [  # Linux / macOS
+        os.path.join(home, ".local", "share", "steslicer", "*", "plugins"),
         os.path.join(home, ".local", "share", "ste_slicer", "*", "plugins"),
         os.path.join(home, ".local", "share", "ste_slicer", "plugins"),
         os.path.join(home, "Library", "Application Support", "ste_slicer", "*", "plugins"),
@@ -117,11 +130,31 @@ class PluginInstaller(Command):
             sys.exit("Не удалось найти папку plugins. Укажите --target или STE_SLICER_PLUGIN_DIR.")
 
     def run(self):
+        if not self.target:
+            self.finalize_options()
         dest = os.path.join(self.target, PLUGIN_FOLDER_NAME)
-        if os.path.isdir(dest):
-            shutil.rmtree(dest)
-        shutil.copytree(PLUGIN_SRC, dest,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.log"))
+        os.makedirs(dest, exist_ok=True)
+        # Удаляем старые скомпилированные .qmlc кэши, чтобы Qt пересобрал новые QML-файлы
+        for r, _, fs in os.walk(dest):
+            for f in fs:
+                if f.endswith(".qmlc"):
+                    try:
+                        os.remove(os.path.join(r, f))
+                    except Exception:
+                        pass
+        for root, dirs, files in os.walk(PLUGIN_SRC):
+            rel_dir = os.path.relpath(root, PLUGIN_SRC)
+            target_dir = os.path.join(dest, rel_dir) if rel_dir != "." else dest
+            os.makedirs(target_dir, exist_ok=True)
+            for f in files:
+                if f.endswith((".pyc", ".log", ".qmlc")) or f == "__pycache__":
+                    continue
+                src_file = os.path.join(root, f)
+                dst_file = os.path.join(target_dir, f)
+                try:
+                    shutil.copy2(src_file, dst_file)
+                except Exception as exc:
+                    print("Предупреждение: не удалось скопировать %s: %s" % (dst_file, exc))
         print("Плагин установлен: %s\nПерезапустите STE Slicer." % dest)
 
 
@@ -188,16 +221,61 @@ class CheckResults(Command):
         print("OK: структура results/ корректна.")
 
 
-setup(
-    name="ste-ai-print-assistant",
-    version="1.0.0",
-    description="ИИ-ассистент подбора параметров FDM 3D/5D-печати для STE Slicer (Cura 3.6)",
-    license="LGPLv3",
-    packages=[],      # плагин копируется как папка, а не ставится как Python-пакет
-    py_modules=[],
-    cmdclass={
-        "install_plugin": PluginInstaller,
-        "package": SubmissionPackager,
-        "check_results": CheckResults,
-    },
-)
+def main_cli():
+    import argparse
+    parser = argparse.ArgumentParser(description="STE AI 3D/5D Print Assistant CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    p_install = subparsers.add_parser("install_plugin", help="Установить плагин в STE Slicer")
+    p_install.add_argument("-t", "--target", help="Путь к папке plugins STE Slicer")
+
+    p_check = subparsers.add_parser("check_results", help="Проверить структуру папки results/")
+
+    p_pkg = subparsers.add_parser("package", help="Собрать архив сдачи <team_name>.zip")
+    p_pkg.add_argument("-n", "--team-name", required=True, help="Название команды")
+    p_pkg.add_argument("-o", "--output-dir", default=ROOT, help="Куда сохранить архив")
+    p_pkg.add_argument("--skip-check", action="store_true", help="Не проверять results/ перед упаковкой")
+
+    args = parser.parse_args()
+
+    if args.command == "install_plugin":
+        cmd = PluginInstaller()
+        cmd.initialize_options()
+        cmd.target = args.target
+        cmd.run()
+    elif args.command == "check_results":
+        cmd = CheckResults()
+        cmd.run()
+    elif args.command == "package":
+        cmd = SubmissionPackager()
+        cmd.initialize_options()
+        cmd.team_name = args.team_name
+        cmd.output_dir = args.output_dir
+        cmd.skip_check = args.skip_check
+        cmd.run()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    if setup is not None:
+        try:
+            setup(
+                name="ste-ai-print-assistant",
+                version="1.0.0",
+                description="ИИ-ассистент подбора параметров FDM 3D/5D-печати для STE Slicer (Cura 3.6)",
+                license="LGPLv3",
+                packages=[],
+                py_modules=[],
+                cmdclass={
+                    "install_plugin": PluginInstaller,
+                    "package": SubmissionPackager,
+                    "check_results": CheckResults,
+                },
+            )
+        except SystemExit:
+            raise
+        except Exception:
+            main_cli()
+    else:
+        main_cli()

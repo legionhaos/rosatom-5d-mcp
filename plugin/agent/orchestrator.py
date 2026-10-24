@@ -85,6 +85,13 @@ class AgentOrchestrator(object):
         self.llm_client = OpenAICompatibleClient(cfg)
         logger.info("AgentOrchestrator LLM client reconfigured: model=%s", model)
 
+    def reload_llm_client(self):
+        # type: () -> None
+        """Reloads the LLM client from the settings manager."""
+        if self.settings_mgr is not None and hasattr(self.settings_mgr, "get_llm_client"):
+            self.llm_client = self.settings_mgr.get_llm_client()
+            logger.info("AgentOrchestrator LLM client reloaded from settings.")
+
     def process_user_request(self,
                              user_prompt,
                              attachments=None,
@@ -121,6 +128,19 @@ class AgentOrchestrator(object):
             len(attachments or [])
         )
 
+        # Check LLM client configuration
+        if not getattr(self.llm_client, "api_url", None) or not getattr(self.llm_client, "api_key", None):
+            self.reload_llm_client()
+            if not getattr(self.llm_client, "api_url", None) or not getattr(self.llm_client, "api_key", None):
+                msg = (
+                    "⚠️ **Параметры подключения к нейросети не настроены.**\n\n"
+                    "Для работы ассистента необходимо указать **Base URL**, **API Key** и **Модель**.\n\n"
+                    "👉 Нажмите кнопку **«⚙ Настройки»** в правом верхнем углу, введите ваши ключи и нажмите «Сохранить»."
+                )
+                summary_card = {"status": "unconfigured"}
+                self._emit_final_answer(cb, msg, summary_card)
+                return msg, summary_card
+
         # 1. Add user turn with attachments (.stl, .3mf, .obj, .png, .jpg)
         self.context_mgr.add_user_turn(user_prompt, attachments)
 
@@ -147,7 +167,19 @@ class AgentOrchestrator(object):
             logger.debug("ReAct iteration %d/%d: calling LLM with %d messages",
                          iteration, self.max_iterations, len(messages))
 
-            llm_response = self.llm_client.chat_completion(messages, tools=tools_schema)
+            try:
+                llm_response = self.llm_client.chat_completion(messages, tools=tools_schema)
+            except Exception as e:
+                logger.exception("LLM chat_completion failed on iteration %d: %s", iteration, e)
+                err_text = (
+                    "❌ **Не удалось получить ответ от нейросети:**\n\n"
+                    "`{0}`\n\n"
+                    "Пожалуйста, проверьте настройки подключения в меню **«⚙ Настройки»** "
+                    "(правильность URL, API ключа и имени модели)."
+                ).format(str(e))
+                summary_card = {"status": "error", "error": str(e)}
+                self._emit_final_answer(cb, err_text, summary_card)
+                return err_text, summary_card
 
             # Check if model requested tool invocations
             if llm_response.tool_calls:

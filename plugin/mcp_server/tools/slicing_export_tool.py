@@ -324,3 +324,8 @@ class ValidateExportTool(BaseMCPTool):
 
 
 __all__ = ["SlicingTool", "ValidateExportTool"]
+
+
+SlicingAndExportTool = SlicingTool
+SlicingExportTool = SlicingTool
+__all__ = ["SlicingTool", "ValidateExportTool", "SlicingAndExportTool", "SlicingExportTool"]

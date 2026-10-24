@@ -444,16 +444,16 @@ class OpenAICompatibleClient(object):
         if isinstance(config, dict):
             raw_url = config.get("base_url") or config.get("api_url") or ""
             self.api_key = str(config.get("api_key") or "").strip()
-            self.model = str(config.get("model") or "").strip()
-            self.timeout = float(config.get("timeout", 60.0))
+            self.model = str(config.get("model") or config.get("model_name") or "").strip()
+            self.timeout = float(config.get("timeout") or config.get("timeout_sec") or 60.0)
             self.verify_ssl = bool(config.get("verify_ssl", True))
             self.max_retries = int(config.get("max_retries", 3))
             self.retry_delay = float(config.get("retry_delay", 1.0))
         else:
             raw_url = getattr(config, "base_url", None) or getattr(config, "api_url", "")
             self.api_key = str(getattr(config, "api_key", "")).strip()
-            self.model = str(getattr(config, "model", "")).strip()
-            self.timeout = float(getattr(config, "timeout", 60.0))
+            self.model = str(getattr(config, "model", None) or getattr(config, "model_name", "")).strip()
+            self.timeout = float(getattr(config, "timeout", None) or getattr(config, "timeout_sec", 60.0))
             self.verify_ssl = bool(getattr(config, "verify_ssl", True))
             self.max_retries = int(getattr(config, "max_retries", 3))
             self.retry_delay = float(getattr(config, "retry_delay", 1.0))

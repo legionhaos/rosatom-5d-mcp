@@ -15,7 +15,33 @@ except ImportError:
         try:
             from PySide2.QtCore import QObject, Signal as pyqtSignal, Slot as pyqtSlot
         except ImportError:
-            from PySide6.QtCore import QObject, Signal as pyqtSignal, Slot as pyqtSlot
+            try:
+                from PySide6.QtCore import QObject, Signal as pyqtSignal, Slot as pyqtSlot
+            except ImportError:
+                class QObject(object):
+                    def __init__(self, parent=None):
+                        self.parent = parent
+
+                def pyqtSlot(*args, **kwargs):
+                    def _dec(f):
+                        return f
+                    return _dec
+
+                class pyqtSignal(object):
+                    def __init__(self, *types):
+                        self._slots = []
+                    def emit(self, *args):
+                        for s in list(self._slots):
+                            try:
+                                s(*args)
+                            except Exception:
+                                pass
+                    def connect(self, slot):
+                        if slot not in self._slots:
+                            self._slots.append(slot)
+                    def disconnect(self, slot):
+                        if slot in self._slots:
+                            self._slots.remove(slot)
 
 try:
     from UM.Extension import Extension
@@ -86,42 +112,46 @@ class AgentBackendAdapter(QObject):
     def configure(self, base_url, api_key, model):
         # type: (str, str, str) -> None
         if self._settings_mgr is not None:
-            self._settings_mgr.save_llm_config(base_url, api_key, model)
+            try:
+                self._settings_mgr.save_llm_config(base_url, api_key, model)
+            except Exception as e:
+                logger.warning("save_llm_config error: %s", e)
         if self._orchestrator is not None:
-            rebuild = getattr(self._orchestrator, "reload_llm_client", None)
-            if rebuild is not None:
-                rebuild()
+            if hasattr(self._orchestrator, "configure_llm"):
+                self._orchestrator.configure_llm(base_url, api_key, model)
+            elif hasattr(self._orchestrator, "reload_llm_client"):
+                self._orchestrator.reload_llm_client()
+        if self._worker is not None and hasattr(self._worker, "configure"):
+            self._worker.configure(base_url, api_key, model)
 
     def check_connection(self, base_url, api_key, model):
-        # type: (str, str, str) -> bool
+        # type: (str, str, str) -> Tuple[bool, str]
         try:
             from plugin.agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
         except ImportError:
             from ..agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
 
         config = LLMConnectionConfig(
-            api_url=base_url,
+            base_url=base_url,
             api_key=api_key,
-            model_name=model,
-            timeout_sec=10,
-            temperature=0.1,
+            model=model,
+            timeout=10.0,
         )
         client = OpenAICompatibleClient(config)
         ok, message = client.test_connection()
         if not ok:
             self.taskFailed.emit(message)
-        return ok
+        return ok, message
 
-    def _on_tool_started(self, call_id, tool_name, args_json):
+    def _on_tool_started(self, tool_name, call_id, args_json):
         self._call_names[str(call_id)] = str(tool_name)
         try:
-            arguments = json.loads(args_json) if args_json else {}
+            arguments = json.loads(args_json) if isinstance(args_json, str) else (args_json or {})
         except (ValueError, TypeError):
             arguments = {"raw": str(args_json)}
         self.toolCallStarted.emit(str(tool_name), str(call_id), arguments)
 
-    def _on_tool_finished(self, call_id, status, summary, duration_ms):
-        tool_name = self._call_names.pop(str(call_id), str(call_id))
+    def _on_tool_finished(self, tool_name, status, summary, duration_ms):
         self.toolCallFinished.emit(str(tool_name), str(status), summary, int(duration_ms))
 
     def _on_final_answer(self, markdown_answer, summary_card):
@@ -132,10 +162,12 @@ class AgentBackendAdapter(QObject):
         self.taskFailed.emit(str(message))
 
 
-class STEAIExtension(Extension):
+class STEAIExtension(QObject, Extension):
 
-    def __init__(self):
-        super(STEAIExtension, self).__init__()
+    def __init__(self, application=None, parent=None):
+        QObject.__init__(self, parent)
+        Extension.__init__(self)
+        self._app_override = application
 
         self._chat_view = None
         self._settings_view = None
@@ -235,8 +267,11 @@ class STEAIExtension(Extension):
             self._controller = ChatController(
                 agent_backend=self._adapter,
                 slicer_bridge=self._camera_manager,
-                settings_store=None,
+                settings_store=self._settings_mgr,
+                extension=self,
             )
+            if self._controller is not None:
+                self._controller.setConnected(app is not None)
         except Exception as exc:
             logger.error("Не удалось создать ChatController: %s", exc)
 
@@ -257,6 +292,8 @@ class STEAIExtension(Extension):
             attach = getattr(self._event_listener, "attach_signals", None)
             if attach is not None:
                 attach()
+        if self._controller is not None:
+            self._controller.setConnected(True)
 
     def _create_qml_component(self, file_name):
         app = self._application()
@@ -266,28 +303,80 @@ class STEAIExtension(Extension):
         if creator is None:
             return None
         path = os.path.join(_QML_DIR, file_name)
-        context = {"controller": self._controller, "manager": self}
+        context = {
+            "controller": self._controller,
+            "manager": self,
+            "chatController": self._controller,
+        }
         try:
-            return creator(path, context)
+            view = creator(path, context)
+            if view is not None and hasattr(view, "setProperty"):
+                try:
+                    view.setProperty("controller", self._controller)
+                    view.setProperty("manager", self)
+                except Exception:
+                    pass
+            return view
         except Exception as exc:
             logger.error("Не удалось создать QML компонент %s: %s", file_name, exc)
             return None
 
+    @pyqtSlot()
     def showChatWindow(self):
-        if self._chat_view is None:
-            self._chat_view = self._create_qml_component("ChatWindow.qml")
-        if self._chat_view is None:
-            return
-        if self._camera_manager is not None:
-            self._camera_manager.set_chat_window(self._chat_view)
-        self._chat_view.show()
+        try:
+            if self._chat_view is not None:
+                try:
+                    _ = self._chat_view.property("visible")
+                except Exception:
+                    self._chat_view = None
 
+            if self._chat_view is None:
+                self._chat_view = self._create_qml_component("ChatWindow.qml")
+            if self._chat_view is None:
+                logger.error("Не удалось создать ChatWindow.qml")
+                return
+
+            if self._camera_manager is not None:
+                self._camera_manager.set_chat_window(self._chat_view)
+
+            if hasattr(self._chat_view, "show"):
+                self._chat_view.show()
+            elif hasattr(self._chat_view, "setProperty"):
+                self._chat_view.setProperty("visible", True)
+
+            if hasattr(self._chat_view, "raise_"):
+                self._chat_view.raise_()
+            if hasattr(self._chat_view, "requestActivate"):
+                self._chat_view.requestActivate()
+        except Exception as exc:
+            logger.error("Ошибка при открытии ChatWindow: %s", exc)
+
+    @pyqtSlot()
     def showSettingsDialog(self):
-        if self._settings_view is None:
-            self._settings_view = self._create_qml_component("SettingsDialog.qml")
-        if self._settings_view is None:
-            return
-        self._settings_view.show()
+        try:
+            if self._settings_view is not None:
+                try:
+                    _ = self._settings_view.property("visible")
+                except Exception:
+                    self._settings_view = None
+
+            if self._settings_view is None:
+                self._settings_view = self._create_qml_component("SettingsDialog.qml")
+            if self._settings_view is None:
+                logger.error("Не удалось создать SettingsDialog.qml")
+                return
+
+            if hasattr(self._settings_view, "show"):
+                self._settings_view.show()
+            elif hasattr(self._settings_view, "setProperty"):
+                self._settings_view.setProperty("visible", True)
+
+            if hasattr(self._settings_view, "raise_"):
+                self._settings_view.raise_()
+            if hasattr(self._settings_view, "requestActivate"):
+                self._settings_view.requestActivate()
+        except Exception as exc:
+            logger.error("Ошибка при открытии SettingsDialog: %s", exc)
 
 
 __all__ = ["STEAIExtension", "AgentBackendAdapter"]

@@ -145,6 +145,22 @@ class PluginSettingsManager(object):
             temperature=float(self._get("temperature")),
         )
 
+    def get_llm_client(self):
+        """Создает и возвращает настроенный экземпляр OpenAICompatibleClient."""
+        try:
+            from ..agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
+        except ImportError:
+            from plugin.agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
+
+        cfg = self.get_llm_config()
+        client_cfg = LLMConnectionConfig(
+            base_url=cfg.api_url or "",
+            api_key=cfg.api_key or "",
+            model=cfg.model_name or "gpt-4o-mini",
+            timeout=float(cfg.timeout_sec or 120),
+        )
+        return OpenAICompatibleClient(client_cfg)
+
     def is_llm_configured(self):
         # type: () -> bool
         try:

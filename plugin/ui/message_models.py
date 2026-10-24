@@ -178,6 +178,17 @@ class MessageListModel(_ListModel):
             "attachmentCount": 0,
         })
 
+    def update_tool(self, tool_name, status, result="", duration_ms=0):
+        for i in reversed(range(len(self._items))):
+            item = self._items[i]
+            if item.get("kind") == "tool_trace" and item.get("toolName") == tool_name and item.get("status") == "pending":
+                return self._update(i, {
+                    "status": status,
+                    "toolResult": result,
+                    "durationMs": duration_ms,
+                })
+        return False
+
 
 class AttachmentListModel(_ListModel):
     _roles = {
