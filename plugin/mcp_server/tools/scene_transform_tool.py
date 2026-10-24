@@ -1,23 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-STE Slicer Plugin — Scene Transform & Parameters Tool (MCP).
-
-Модуль пространственной трансформации объектов и управления параметрами
-слайсинга в среде STE Slicer / Cura 3.6 / Uranium.
-
-Выполняет:
-1. Вращение ноды через кватернионы Uranium (UM.Math.Quaternion.fromAngleAxis)
-   с прецизионным согласованием знаков и осей между Uranium (Y-up) и 3D-печатью (Z-up).
-2. Посадку детали на платформу (выравнивание нижней границы Bounding Box в Z=0).
-3. Центрирование и позиционирование центра Bounding Box на столе / авторасстановку.
-4. Запись переопределений параметров в контейнеры userChanges стеков
-   GlobalStack и ExtruderStack со строгой типизацией и проверкой через getProperty(key, "value").
-
-Zero-Dependency: использует только стандартный Python, Uranium (UM.*) и Cura (cura.*).
-Потокобезопасность: все операции со сценой и стеками выполняются строго
-в главном потоке GUI через MainThreadDispatcher.
-"""
-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import math
@@ -26,12 +7,11 @@ import sys
 import traceback
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Безопасный импорт контракта MCP и исключений
 try:
     from plugin.mcp_server.server import BaseMCPTool
 except (ImportError, AttributeError):
     class BaseMCPTool(object):
-        """Резервный базовый класс инструмента MCP."""
+        """Fallback base class for MCP tools."""
         name = ""
         description = ""
         parameters_schema = {}  # type: Dict[str, Any]
@@ -50,7 +30,7 @@ try:
     )
 except (ImportError, AttributeError):
     class STEPluginError(Exception):
-        """Базовое исключение плагина STE Slicer."""
+        """Base exception for STE Slicer plugin."""
         def __init__(self, message, code="STE_PLUGIN_ERROR", details=None):
             super(STEPluginError, self).__init__(message)
             self.code = code
@@ -83,7 +63,7 @@ try:
     from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
 except (ImportError, AttributeError):
     class MainThreadDispatcher(object):
-        """Диспетчер выполнения задач в основном потоке GUI Cura/Qt."""
+        """Main thread GUI dispatcher for Cura/Qt."""
         @staticmethod
         def run_sync(func, *args, **kwargs):
             try:
@@ -114,15 +94,12 @@ except (ImportError, AttributeError):
 
 
 class SceneTransformTool(BaseMCPTool):
-    """
-    Инструмент пространственной ориентации детали на платформе
-    и настройки технологических параметров нарезки.
-    """
+    """MCP tool for spatial scene transformations and slicer stack parameter modifications."""
 
     name = "modify_scene_and_parameters"
     description = (
-        "Трансформация объекта на сцене (поворот, опускание на стол, "
-        "авторасстановка) и изменение параметров нарезки в GlobalStack и ExtruderStack."
+        "Applies spatial transformations (rotation, build plate drop, arrangement) "
+        "and sets slicing parameters in GlobalStack and ExtruderStack userChanges."
     )
 
     parameters_schema = {
@@ -130,51 +107,47 @@ class SceneTransformTool(BaseMCPTool):
         "properties": {
             "node_id": {
                 "type": "string",
-                "description": "Идентификатор ноды на сцене (SceneNode ID или имя)."
+                "description": "Identifier or name of the SceneNode on the scene."
             },
             "file_path": {
                 "type": "string",
-                "description": "Путь к файлу детали, если объект требуется предварительно загрузить."
+                "description": "Path to the 3D model file if loading is required prior to transformation."
             },
             "rotation_euler_deg": {
                 "type": "array",
                 "items": {"type": "number"},
                 "minItems": 3,
                 "maxItems": 3,
-                "description": "Углы поворота [rx, ry, rz] в градусах в координатах 3D-печати (Z-up)."
+                "description": "Rotation angles [rx, ry, rz] in degrees in print coordinate space (Z-up)."
             },
             "position_xy_mm": {
                 "type": "array",
                 "items": {"type": "number"},
                 "minItems": 2,
                 "maxItems": 2,
-                "description": "Координаты центра детали на столе [x, y] в мм."
+                "description": "Target center coordinates [x, y] in mm on the build plate."
             },
             "scale_factor": {
                 "type": "number",
-                "description": "Коэффициент пропорционального масштабирования (например, 1.0 = 100%, 1.5 = 150%)."
+                "description": "Uniform scale factor (e.g. 1.0 = 100%, 1.5 = 150%)."
             },
             "auto_arrange_on_plate": {
                 "type": "boolean",
-                "description": "Выполнить автоматическую расстановку на платформе и посадку на стол Z=0.",
+                "description": "Automatically arrange node on the build plate and drop to Z=0.",
                 "default": True
             },
             "supports_enabled": {
                 "type": "boolean",
-                "description": "Быстрое переключение генерации поддержек (параметр support_enable)."
+                "description": "Direct toggle for support generation (support_enable setting)."
             },
             "print_parameters": {
                 "type": "object",
-                "description": (
-                    "Словарь переопределения параметров слайсинга (layer_height, "
-                    "wall_line_count, infill_sparse_density, material_print_temperature и др.)."
-                )
+                "description": "Key-value dictionary of slicing settings to override in container stacks."
             }
         },
         "required": []
     }
 
-    # Белый список допустимых параметров слайсинга и их строгие типы
     _SETTING_TYPES = {
         "support_enable": bool,
         "support_type": str,
@@ -211,9 +184,7 @@ class SceneTransformTool(BaseMCPTool):
 
     def execute(self, **kwargs):
         # type: (**Any) -> Dict[str, Any]
-        """
-        Выполнение трансформации объекта и записи настроек в стек.
-        """
+        """Execute node transformations and write parameter overrides."""
         try:
             node_id = kwargs.get("node_id")
             file_path = kwargs.get("file_path")
@@ -226,7 +197,6 @@ class SceneTransformTool(BaseMCPTool):
 
             warnings = []  # type: List[str]
 
-            # Выполняем всю последовательность модификации в главном потоке GUI
             result = MainThreadDispatcher.run_sync(
                 self._apply_transforms_and_settings,
                 node_id=node_id,
@@ -247,10 +217,6 @@ class SceneTransformTool(BaseMCPTool):
         except Exception as exc:
             return format_exception_for_llm(exc)
 
-    # ----------------------------------------------------------------------
-    #  Внутренняя логика модификации сцены (выполняется в GUI потоке)
-    # ----------------------------------------------------------------------
-
     def _apply_transforms_and_settings(
         self,
         node_id,
@@ -263,47 +229,39 @@ class SceneTransformTool(BaseMCPTool):
         print_parameters,
         warnings
     ):
+        """Internal transformation pipeline executed synchronously on the Qt main thread."""
         from cura.CuraApplication import CuraApplication
         from UM.Math.Quaternion import Quaternion
         from UM.Math.Vector import Vector
 
         app = CuraApplication.getInstance()
         if not app:
-            raise SceneError("CuraApplication не инициализировано.")
+            raise SceneError("CuraApplication is not initialized.")
 
         scene = app.getController().getScene()
         if not scene:
-            raise SceneError("Scene контроллера недоступна.")
+            raise SceneError("Scene controller is unavailable.")
 
-        # 1. Поиск ноды на сцене или чтение файла
         node = self._resolve_node(app, scene, file_path, node_id)
         if node is None:
             raise SceneError(
-                "Не найден объект для трансформации.",
+                "Target scene node was not found.",
                 details={"node_id": node_id, "file_path": file_path}
             )
 
-        # 2. Применение масштабирования (Scale)
         applied_scale = None
         if scale_factor is not None:
             factor = float(scale_factor)
             if factor <= 0.0:
-                raise STEPluginError("Коэффициент масштабирования должен быть строго больше 0.")
+                raise STEPluginError("Scale factor must be strictly greater than 0.")
             current_scale = node.getScale()
             node.setScale(Vector(current_scale.x * factor, current_scale.y * factor, current_scale.z * factor))
             applied_scale = factor
 
-        # 3. Применение вращения (Rotate)
-        # ВАЖНО: Матрица перехода между печатью (X, Y_depth, Z_height) и Uranium (X, Y_height, Z_depth)
-        # имеет нечетную перестановку осей (det = -1). Для сохранения направления обхода
-        # углы поворота вокруг осей Uranium берутся со знаком МИНУС:
-        #   - Вращение вокруг X_print -> Uranium Vector(1, 0, 0), угол: -rx
-        #   - Вращение вокруг Y_print (глубина) -> Uranium Vector(0, 0, 1), угол: -ry
-        #   - Вращение вокруг Z_print (высота) -> Uranium Vector(0, 1, 0), угол: -rz
         applied_rotation = None
         if rotation_euler_deg is not None:
             if not isinstance(rotation_euler_deg, (list, tuple)) or len(rotation_euler_deg) != 3:
-                raise STEPluginError("Параметр rotation_euler_deg должен содержать 3 числа [rx, ry, rz].")
+                raise STEPluginError("Parameter rotation_euler_deg must contain 3 numbers [rx, ry, rz].")
 
             rx = float(rotation_euler_deg[0])
             ry = float(rotation_euler_deg[1])
@@ -318,24 +276,20 @@ class SceneTransformTool(BaseMCPTool):
             node.setOrientation(rot_quat * current_orient)
             applied_rotation = [rx, ry, rz]
 
-        # 4. Посадка детали на стол после поворота (пересчет BoundingBox и опускание на Y=0)
         self._drop_node_to_build_plate(node)
 
-        # 5. Позиционирование / Авторасстановка детали
         applied_position = None
         if position_xy_mm is not None:
             if not isinstance(position_xy_mm, (list, tuple)) or len(position_xy_mm) != 2:
-                raise STEPluginError("Параметр position_xy_mm должен содержать 2 координаты [x, y].")
+                raise STEPluginError("Parameter position_xy_mm must contain 2 coordinates [x, y].")
             target_x = float(position_xy_mm[0])
             target_y = float(position_xy_mm[1])
 
-            # Позиционируем ГЕОМЕТРИЧЕСКИЙ ЦЕНТР детали (Bounding Box center), а не origin
             bbox = node.getBoundingBox()
             if bbox is not None:
                 cx = (bbox.left + bbox.right) / 2.0
                 cz = (bbox.front + bbox.back) / 2.0
                 current_pos = node.getPosition()
-                # target_x -> Print X (Uranium X), target_y -> Print Y (Uranium Z)
                 node.setPosition(Vector(
                     current_pos.x + (target_x - cx),
                     current_pos.y,
@@ -345,7 +299,6 @@ class SceneTransformTool(BaseMCPTool):
                 current_pos = node.getPosition()
                 node.setPosition(Vector(target_x, current_pos.y, target_y))
 
-            # Финальная посадка на платформу после сдвига
             self._drop_node_to_build_plate(node)
             applied_position = [target_x, target_y]
 
@@ -353,18 +306,16 @@ class SceneTransformTool(BaseMCPTool):
             arranged = self._arrange_node(app, scene, node)
             if not arranged:
                 self._center_node_on_plate(node)
-                warnings.append("Модуль cura.Arranging.Arrange недоступен, выполнено центрирование на столе.")
+                warnings.append("Module cura.Arranging.Arrange unavailable; centered on plate.")
             self._drop_node_to_build_plate(node)
 
-        # Финальные координаты в печатной системе координат
         final_uranium_pos = node.getPosition()
         world_position_print = [
             round(final_uranium_pos.x, 3),
-            round(final_uranium_pos.z, 3),  # Uranium Z -> Print Y
-            round(final_uranium_pos.y, 3)   # Uranium Y -> Print Z (высота)
+            round(final_uranium_pos.z, 3),
+            round(final_uranium_pos.y, 3)
         ]
 
-        # 6. Запись параметров нарезки в GlobalStack и ExtruderStack
         if supports_enabled is not None:
             print_parameters["support_enable"] = bool(supports_enabled)
 
@@ -387,16 +338,8 @@ class SceneTransformTool(BaseMCPTool):
             "warnings": warnings
         }
 
-    # ----------------------------------------------------------------------
-    #  Геометрические трансформации ноды
-    # ----------------------------------------------------------------------
-
     def _drop_node_to_build_plate(self, node):
-        """
-        Посадка детали на стол: в Uranium вертикальной осью экрана является Y.
-        BoundingBox().bottom определяет нижнюю границу геометрии в родительском пространстве.
-        Для посадки в Z=0 смещаем ноду на -bottom по оси Y.
-        """
+        """Align bottom boundary of node bounding box with build plate Y=0."""
         from UM.Math.Vector import Vector
         bbox = node.getBoundingBox()
         if bbox is not None:
@@ -405,7 +348,7 @@ class SceneTransformTool(BaseMCPTool):
             node.setPosition(Vector(current_pos.x, current_pos.y + delta_y, current_pos.z))
 
     def _center_node_on_plate(self, node):
-        """Центрирование геометрического центра детали в плоскости рабочего стола (X и Z в Uranium)."""
+        """Center the bounding box center in the Uranium build plate plane (X and Z)."""
         from UM.Math.Vector import Vector
         bbox = node.getBoundingBox()
         if bbox is not None:
@@ -415,7 +358,7 @@ class SceneTransformTool(BaseMCPTool):
             node.setPosition(Vector(current_pos.x - cx, current_pos.y, current_pos.z - cz))
 
     def _arrange_node(self, app, scene, target_node):
-        """Попытка расстановки объектов через cura.Arranging.Arrange."""
+        """Execute Cura arrange algorithm if available."""
         try:
             from cura.Arranging.Arrange import Arrange
             all_mesh_nodes = [
@@ -440,7 +383,7 @@ class SceneTransformTool(BaseMCPTool):
         return False
 
     def _resolve_node(self, app, scene, file_path, node_id):
-        """Находит существующий SceneNode или загружает новый файл."""
+        """Retrieve SceneNode by identifier or import from file."""
         if node_id:
             found = self._find_node_by_id(scene.getRoot(), str(node_id))
             if found:
@@ -448,7 +391,7 @@ class SceneTransformTool(BaseMCPTool):
 
         if file_path:
             if not os.path.exists(file_path):
-                raise MeshError("Файл не найден: {}".format(file_path))
+                raise MeshError("File not found: {}".format(file_path))
             handler = app.getMeshFileHandler()
             if handler:
                 loaded = handler.read(file_path)
@@ -460,13 +403,13 @@ class SceneTransformTool(BaseMCPTool):
             if children:
                 return children[-1]
 
-        # Иначе первый полигональный объект сцены
         for child in scene.getRoot().getAllChildren():
             if hasattr(child, "getMeshData") and child.getMeshData():
                 return child
         return None
 
     def _find_node_by_id(self, parent_node, target_id):
+        """Recursively locate node by ID or name."""
         if str(getattr(parent_node, "getId", lambda: "")()) == target_id:
             return parent_node
         if str(getattr(parent_node, "getName", lambda: "")()) == target_id:
@@ -478,18 +421,11 @@ class SceneTransformTool(BaseMCPTool):
                 return res
         return None
 
-    # ----------------------------------------------------------------------
-    #  Управление стеками настроек Cura (GlobalStack / ExtruderStack)
-    # ----------------------------------------------------------------------
-
     def _apply_slicer_parameters(self, app, print_parameters, warnings):
-        """
-        Запись настроек в контейнеры userChanges глобального стека и экструдеров
-        со строгой типизацией значений.
-        """
+        """Validate, cast, and persist parameter values into container stack userChanges."""
         global_stack = app.getGlobalContainerStack()
         if not global_stack:
-            raise SceneError("Отсутствует активный принтер / GlobalStack. Нарезка невозможна.")
+            raise SceneError("Active GlobalStack is missing.")
 
         extruder_stack = None
         extruders = getattr(global_stack, "extruders", None)
@@ -522,10 +458,9 @@ class SceneTransformTool(BaseMCPTool):
 
         for key, raw_value in print_parameters.items():
             if key not in self._SETTING_TYPES:
-                warnings.append("Параметр '{}' не входит в список разрешенных настроек — пропущен.".format(key))
+                warnings.append("Parameter '{}' not in supported whitelist; skipped.".format(key))
                 continue
 
-            # Приведение типа значения к спецификации Cura
             expected_type = self._SETTING_TYPES[key]
             try:
                 if expected_type is bool:
@@ -540,10 +475,9 @@ class SceneTransformTool(BaseMCPTool):
                 else:
                     typed_value = str(raw_value)
             except (ValueError, TypeError) as cast_err:
-                warnings.append("Ошибка приведения типа для '{}': {}. Пропущен.".format(key, cast_err))
+                warnings.append("Type cast failure for '{}': {}. Skipped.".format(key, cast_err))
                 continue
 
-            # Определение целевого стека
             is_per_extruder = False
             try:
                 is_per_extruder = bool(global_stack.getProperty(key, "settable_per_extruder"))
@@ -557,29 +491,24 @@ class SceneTransformTool(BaseMCPTool):
                 target_stack = extruder_stack
                 stack_name = "ExtruderStack[0]"
 
-            # Получаем контейнер изменений пользователя (userChanges)
             user_container = self._get_user_changes_container(target_stack)
             if not user_container:
-                warnings.append("Не найден контейнер 'userChanges' в {} для ключа '{}'.".format(stack_name, key))
+                warnings.append("userChanges container not found in {} for '{}'.".format(stack_name, key))
                 continue
 
-            # Фиксируем старое значение
             try:
                 old_val = target_stack.getProperty(key, "value")
             except Exception:
                 old_val = None
 
-            # Записываем строго через userChanges.setProperty(key, "value", typed_value)
             try:
                 user_container.setProperty(key, "value", typed_value)
-                # Уведомляем стек об обновлении для запуска реактивного пересчета
                 if hasattr(target_stack, "propertyChanged"):
                     target_stack.propertyChanged.emit(key, "value")
             except Exception as e:
-                warnings.append("Ошибка записи {}.{} = {}: {}".format(stack_name, key, typed_value, str(e)))
+                warnings.append("Failed writing {}.{} = {}: {}".format(stack_name, key, typed_value, str(e)))
                 continue
 
-            # Верифицируем результат через getProperty
             try:
                 verified_new_val = target_stack.getProperty(key, "value")
             except Exception:
@@ -594,17 +523,13 @@ class SceneTransformTool(BaseMCPTool):
         return applied_report
 
     def _get_user_changes_container(self, stack):
-        """
-        Извлекает контейнер пользовательских изменений stack.userChanges
-        согласно архитектуре Uranium ContainerStack.
-        """
+        """Retrieve stack userChanges container instance."""
         if hasattr(stack, "userChanges") and stack.userChanges is not None:
             return stack.userChanges
 
         if hasattr(stack, "userChangesContainer") and stack.userChangesContainer is not None:
             return stack.userChangesContainer
 
-        # Поиск по списку контейнеров
         if hasattr(stack, "getContainerCount") and hasattr(stack, "getContainer"):
             for idx in range(stack.getContainerCount()):
                 container = stack.getContainer(idx)
@@ -622,7 +547,7 @@ class SceneTransformTool(BaseMCPTool):
 
     @staticmethod
     def _serialize_value(val):
-        """Сериализация значения настройки в JSON-совместимый тип."""
+        """Serialize configuration value to JSON-compatible data type."""
         if val is None or isinstance(val, (int, float, bool, str)):
             return val
         if hasattr(val, "value"):
