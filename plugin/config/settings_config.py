@@ -1,115 +1,175 @@
 # -*- coding: utf-8 -*-
 """
-Settings and configuration models for STE Slicer plugin.
+Настройки плагина: API URL / Key / модель LLM, тайм-аут, температура, папка results/.
+
+Хранилище: Preferences STE Slicer (ключи ste_ai_assistant/*), поэтому введённые жюри
+URL и ключ сохраняются между перезапусками. Вне слайсера (тесты) — JSON-файл
+~/.ste_ai_assistant/settings.json. Приоритет значений:
+    сохранённое в UI  >  переменные окружения (STE_LLM_URL / STE_LLM_KEY / STE_LLM_MODEL)  >  дефолт.
 """
-
 import json
-import logging
 import os
-from typing import Dict, Any, Optional
+import threading
+from collections import namedtuple
+from typing import Any, Optional
 
-from plugin.agent.llm_client import LLMConnectionConfig
+from ..utils.exceptions import ConfigError
 
-logger = logging.getLogger("PluginSettingsManager")
+LLMConnectionConfig = namedtuple(
+    "LLMConnectionConfig", ["api_url", "api_key", "model_name", "timeout_sec", "temperature"])
+
+PREFIX = "ste_ai_assistant/"
+DEFAULTS = {
+    "api_url": "",
+    "api_key": "",
+    "model_name": "gpt-4o-mini",
+    "timeout_sec": 120,
+    "temperature": 0.1,
+    "results_dir": "",
+}
+ENV_MAP = {"api_url": "STE_LLM_URL", "api_key": "STE_LLM_KEY", "model_name": "STE_LLM_MODEL",
+           "results_dir": "STE_AI_RESULTS_DIR"}
+_FALLBACK_FILE = os.path.join(os.path.expanduser("~"), ".ste_ai_assistant", "settings.json")
 
 
 class PluginSettingsManager(object):
-    """
-    Manages persistent configuration for the STE Slicer plugin,
-    including LLM connection credentials, endpoint URLs, and slicing defaults.
-    """
+    """Единая точка доступа к настройкам плагина."""
 
-    DEFAULT_CONFIG_PATH = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "config",
-        "plugin_settings.json"
-    )
+    def __init__(self, application=None):
+        # type: (Any) -> None
+        self._lock = threading.RLock()
+        self._app = application
+        self._prefs = self._resolve_preferences(application)
+        self._file_cache = None  # используется только без Preferences
+        self._register_defaults()
 
-    def __init__(self, config_path=None, llm_config=None):
-        # type: (Optional[str], Optional[LLMConnectionConfig]) -> None
-        self.config_path = str(config_path or self.DEFAULT_CONFIG_PATH)
-        self.settings = {}  # type: Dict[str, Any]
+    # ----------------------------- хранилище ------------------------------ #
+    @staticmethod
+    def _resolve_preferences(application):
+        if application is not None and hasattr(application, "getPreferences"):
+            try:
+                return application.getPreferences()
+            except Exception:
+                pass
+        try:
+            from UM.Preferences import Preferences
+            return Preferences.getInstance()
+        except Exception:
+            return None  # вне слайсера
 
-        if llm_config is not None:
-            self.llm_config = llm_config
-        else:
-            self.llm_config = LLMConnectionConfig()
+    def _register_defaults(self):
+        if self._prefs is None:
+            return
+        for key, value in DEFAULTS.items():
+            self._prefs.addPreference(PREFIX + key, value)
 
-        self._client = None  # type: Optional[Any]
-        self.load()
+    def _load_file(self):
+        if self._file_cache is None:
+            try:
+                with open(_FALLBACK_FILE, "r", encoding="utf-8") as f:
+                    self._file_cache = json.load(f)
+            except (OSError, IOError, ValueError):
+                self._file_cache = {}
+        return self._file_cache
+
+    def _get_raw(self, key):
+        with self._lock:
+            if self._prefs is not None:
+                return self._prefs.getValue(PREFIX + key)
+            return self._load_file().get(key, DEFAULTS[key])
+
+    def _set_raw(self, key, value):
+        with self._lock:
+            if self._prefs is not None:
+                self._prefs.setValue(PREFIX + key, value)
+                return
+            data = self._load_file()
+            data[key] = value
+            os.makedirs(os.path.dirname(_FALLBACK_FILE), exist_ok=True)
+            with open(_FALLBACK_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _get(self, key):
+        """Сохранённое значение -> env -> дефолт."""
+        value = self._get_raw(key)
+        if value in (None, "") and key in ENV_MAP:
+            value = os.environ.get(ENV_MAP[key], "")
+        if value in (None, ""):
+            value = DEFAULTS[key]
+        return value
+
+    def _flush(self):
+        """Просим слайсер сохранить Preferences на диск сразу (а не при выходе)."""
+        if self._app is not None and hasattr(self._app, "savePreferences"):
+            try:
+                self._app.savePreferences()
+            except Exception:
+                pass
+
+    # ------------------------------ LLM ----------------------------------- #
+    @staticmethod
+    def _normalize_url(url):
+        url = (url or "").strip().rstrip("/")
+        if url and not (url.startswith("http://") or url.startswith("https://")):
+            raise ConfigError("API URL должен начинаться с http:// или https://")
+        return url
 
     def get_llm_config(self):
         # type: () -> LLMConnectionConfig
-        """Returns the active LLM connection configuration."""
-        return self.llm_config
+        return LLMConnectionConfig(
+            api_url=self._normalize_url(str(self._get("api_url"))),
+            api_key=str(self._get("api_key")).strip(),
+            model_name=str(self._get("model_name")).strip(),
+            timeout_sec=int(self._get("timeout_sec")),
+            temperature=float(self._get("temperature")),
+        )
 
-    def get_llm_client(self):
-        # type: () -> Any
-        """Returns or lazily creates an OpenAICompatibleClient instance."""
-        if self._client is None:
-            from plugin.agent.llm_client import OpenAICompatibleClient
-            self._client = OpenAICompatibleClient(self.llm_config)
-        return self._client
-
-    def set_llm_config(self, config):
-        # type: (LLMConnectionConfig) -> None
-        """Updates the LLM connection configuration and resets client."""
-        self.llm_config = config
-        self._client = None
-        self.settings["base_url"] = config.base_url
-        self.settings["api_key"] = config.api_key
-        self.settings["model"] = config.model
-        self.settings["timeout"] = config.timeout
-        self.settings["verify_ssl"] = config.verify_ssl
-
-    def get(self, key, default=None):
-        # type: (str, Any) -> Any
-        """Gets a configuration parameter by key."""
-        return self.settings.get(key, default)
-
-    def set(self, key, value):
-        # type: (str, Any) -> None
-        """Sets a configuration parameter by key."""
-        self.settings[key] = value
-
-    def load(self, path=None):
-        # type: (Optional[str]) -> bool
-        """Loads configuration from JSON file."""
-        target_path = path or self.config_path
-        if os.path.isfile(target_path):
-            try:
-                with open(target_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    self.settings = data
-                    self.llm_config = LLMConnectionConfig(
-                        base_url=data.get("base_url", self.llm_config.base_url),
-                        api_key=data.get("api_key", self.llm_config.api_key),
-                        model=data.get("model", self.llm_config.model),
-                        timeout=data.get("timeout", self.llm_config.timeout),
-                        verify_ssl=data.get("verify_ssl", self.llm_config.verify_ssl),
-                        max_retries=data.get("max_retries", self.llm_config.max_retries),
-                        retry_delay=data.get("retry_delay", self.llm_config.retry_delay),
-                    )
-                    self._client = None
-                    return True
-            except Exception as e:
-                logger.warning("Failed to load settings from '%s': %s", target_path, e)
-        return False
-
-    def save(self, path=None):
-        # type: (Optional[str]) -> bool
-        """Saves configuration to JSON file."""
-        target_path = path or self.config_path
+    def is_llm_configured(self):
+        # type: () -> bool
         try:
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            self.settings.update(self.llm_config.to_dict())
-            with open(target_path, "w", encoding="utf-8") as f:
-                json.dump(self.settings, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            logger.error("Failed to save settings to '%s': %s", target_path, e)
+            cfg = self.get_llm_config()
+        except ConfigError:
             return False
+        return bool(cfg.api_url and cfg.api_key and cfg.model_name)
 
+    def save_llm_config(self, api_url, api_key, model_name, timeout_sec=None, temperature=None):
+        # type: (str, str, str, Optional[int], Optional[float]) -> None
+        url = self._normalize_url(api_url)
+        if not url:
+            raise ConfigError("Укажите API URL (например, https://host/v1)")
+        if not (api_key or "").strip():
+            raise ConfigError("Укажите API Key")
+        if not (model_name or "").strip():
+            raise ConfigError("Укажите название модели")
+        self._set_raw("api_url", url)
+        self._set_raw("api_key", api_key.strip())
+        self._set_raw("model_name", model_name.strip())
+        if timeout_sec is not None:
+            self._set_raw("timeout_sec", int(timeout_sec))
+        if temperature is not None:
+            self._set_raw("temperature", float(temperature))
+        self._flush()
 
-__all__ = ["LLMConnectionConfig", "PluginSettingsManager"]
+    def get_masked_api_key(self):
+        # type: () -> str
+        """Для показа в UI: sk-ab…xyz."""
+        key = self.get_llm_config().api_key
+        if len(key) <= 8:
+            return "*" * len(key)
+        return key[:4] + "…" + key[-3:]
+
+    # ---------------------------- results/ -------------------------------- #
+    def get_results_root_dir(self):
+        # type: () -> str
+        """Корень для results/<model_name>/. По умолчанию ~/STE_AI_results
+        (папка plugins бывает read-only). Перед сдачей копируйте содержимое в results/ архива."""
+        path = str(self._get("results_dir")).strip()
+        if not path:
+            path = os.path.join(os.path.expanduser("~"), "STE_AI_results")
+        return os.path.abspath(os.path.expanduser(path))
+
+    def set_results_root_dir(self, path):
+        # type: (str) -> None
+        self._set_raw("results_dir", os.path.abspath(os.path.expanduser(path)))
+        self._flush()
+
