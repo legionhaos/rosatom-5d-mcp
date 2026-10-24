@@ -10,7 +10,14 @@ public slots below, keeping QML independent from the agent implementation.
 import json
 import mimetypes
 import os
+import tempfile
 import time
+
+try:
+    from PyQt5.QtCore import QTimer, QUrl
+except ImportError:
+    QTimer = None
+    QUrl = None
 
 try:
     from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
@@ -79,6 +86,8 @@ class ChatController(QObject):
     busyChanged = pyqtSignal()
     slicingProgressChanged = pyqtSignal()
     printResultChanged = pyqtSignal()
+    previewChanged = pyqtSignal()
+    _previewScheduled = pyqtSignal()
 
     def __init__(self, agent_backend=None, slicer_bridge=None, settings_store=None, extension=None, parent=None):
         super().__init__(parent)
@@ -99,6 +108,21 @@ class ChatController(QObject):
         self._print_time = ""
         self._material_usage = ""
         self._active_tools = {}
+        self._preview_url = ""
+        self._preview_message = "Превью появится после загрузки модели"
+        self._model_info = ""
+        self._preview_counter = 0
+        self._preview_path = ""
+        self._rendering_preview = False
+        self._preview_timer = None
+        if QTimer is not None:
+            # Scene changes arrive in bursts (load, rotate, scale), so the
+            # snapshot is debounced instead of being rendered on every event.
+            self._preview_timer = QTimer(self)
+            self._preview_timer.setSingleShot(True)
+            self._preview_timer.setInterval(600)
+            self._preview_timer.timeout.connect(self.refreshPreview)
+            self._previewScheduled.connect(self._startPreviewTimer)
         self._connect_backend_signals()
 
     @pyqtProperty(QObject, constant=True)
@@ -143,6 +167,18 @@ class ChatController(QObject):
     @pyqtProperty(int, notify=modelCountChanged)
     def modelCount(self):
         return self._model_count
+
+    @pyqtProperty(str, notify=previewChanged)
+    def previewUrl(self):
+        return self._preview_url
+
+    @pyqtProperty(str, notify=previewChanged)
+    def previewMessage(self):
+        return self._preview_message
+
+    @pyqtProperty(str, notify=previewChanged)
+    def modelInfo(self):
+        return self._model_info
 
     @pyqtProperty(int, notify=slicingProgressChanged)
     def slicingProgress(self):
@@ -253,14 +289,128 @@ class ChatController(QObject):
         size = os.path.getsize(path)
         size_text = "{0:.1f} KB".format(size / 1024.0) if size < 1024 * 1024 else "{0:.1f} MB".format(size / 1024.0 / 1024.0)
         self._attachments.append_file(os.path.basename(path), path, kind, size_text)
-        self._model_count = 1 if kind == "model" else self._model_count
+        self.refreshModelCount()
         self.modelCountChanged.emit()
         self.messageAdded.emit()
+
+    def _attached_model_count(self):
+        return len([p for p in self._attachments.paths() if os.path.splitext(p)[1].lower() in (".stl", ".obj", ".3mf")])
+
+    def _scene_model_count(self):
+        return len(self._scene_nodes())
+
+    def onSceneChanged(self, source=None, *args):
+        if self._rendering_preview:
+            return
+        try:
+            from UM.Scene.Camera import Camera
+            if isinstance(source, Camera):
+                return
+        except Exception:
+            pass
+        self.refreshModelCount()
+        self._previewScheduled.emit()
+
+    def _startPreviewTimer(self):
+        if self._preview_timer is not None:
+            self._preview_timer.start()
+
+    def _scene_nodes(self):
+        try:
+            from UM.Application import Application
+            from UM.Scene.Iterator.DepthFirstIterator import DepthFirstIterator
+            root = Application.getInstance().getController().getScene().getRoot()
+        except Exception:
+            return []
+        nodes = []
+        for node in DepthFirstIterator(root):
+            try:
+                if node.callDecoration("isSliceable") and node.getMeshData() is not None:
+                    nodes.append(node)
+            except Exception:
+                pass
+        return nodes
+
+    def _describe_models(self, nodes):
+        parts = []
+        for node in nodes[:3]:
+            name = node.getName() if hasattr(node, "getName") else "model"
+            try:
+                box = node.getBoundingBox()
+                parts.append("{0} · {1:.0f}×{2:.0f}×{3:.0f} мм".format(name, box.width, box.depth, box.height))
+            except Exception:
+                parts.append(name)
+        if len(nodes) > 3:
+            parts.append("и ещё {0}".format(len(nodes) - 3))
+        return "\n".join(parts)
+
+    def _set_preview(self, url, message, info):
+        self._preview_url = url
+        self._preview_message = message
+        self._model_info = info
+        self.previewChanged.emit()
+
+    def _remove_snapshot_cameras(self):
+        # Snapshot.snapshot() parents a temporary camera to the scene root and
+        # never removes it; repeated previews would otherwise accumulate them.
+        try:
+            from UM.Application import Application
+            from UM.Scene.Camera import Camera
+            root = Application.getInstance().getController().getScene().getRoot()
+            for child in list(root.getChildren()):
+                if isinstance(child, Camera) and child.getName() == "snapshot":
+                    root.removeChild(child)
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def refreshPreview(self):
+        if self._rendering_preview:
+            return
+        nodes = self._scene_nodes()
+        if not nodes:
+            self._set_preview("", "Загрузите модель на стол STE Slicer", "")
+            return
+        info = self._describe_models(nodes)
+        self._rendering_preview = True
+        try:
+            try:
+                from steslicer.Snapshot import Snapshot
+            except ImportError:
+                from cura.Snapshot import Snapshot
+            try:
+                image = Snapshot.snapshot(width=640, height=480)
+            except TypeError:
+                image = Snapshot.snapshot()
+            self._remove_snapshot_cameras()
+            if image is None:
+                self._set_preview("", "Не удалось построить превью", info)
+                return
+            self._preview_counter += 1
+            path = os.path.join(tempfile.gettempdir(), "ste_ai_preview_{0}.png".format(self._preview_counter % 2))
+            if not image.save(path):
+                self._set_preview("", "Не удалось сохранить превью", info)
+                return
+            url = QUrl.fromLocalFile(path).toString() if QUrl is not None else "file:///" + path.replace("\\", "/")
+            # Two alternating file names force QML to reload the image.
+            self._set_preview(url, "", info)
+        except Exception as exc:
+            self._set_preview("", "Превью недоступно: {0}".format(exc), info)
+        finally:
+            self._rendering_preview = False
+
+    @pyqtSlot()
+    def refreshModelCount(self):
+        value = max(self._attached_model_count(), self._scene_model_count())
+        if value != self._model_count:
+            self._model_count = value
+            self.modelCountChanged.emit()
 
     @pyqtSlot(int)
     def removeAttachment(self, index):
         self._attachments.remove_at(index)
-        self._model_count = len([p for p in self._attachments.paths() if os.path.splitext(p)[1].lower() in (".stl", ".obj", ".3mf")])
+        self._model_count = self._attached_model_count()
+        self.refreshModelCount()
         self.modelCountChanged.emit()
 
     @pyqtSlot()
@@ -271,6 +421,7 @@ class ChatController(QObject):
         self._tools.clear()
         self._attachments.clear()
         self._model_count = 0
+        self.refreshModelCount()
         self.modelCountChanged.emit()
         self.messageAdded.emit()
 

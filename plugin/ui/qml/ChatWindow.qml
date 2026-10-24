@@ -1,1015 +1,668 @@
 import QtQuick 2.7
 import QtQuick.Controls 1.4
-import QtQuick.Controls.Styles 1.4
+import QtQuick.Dialogs 1.2
 import QtQuick.Layouts 1.1
 import QtQuick.Window 2.2
 
+/*
+ * Focused workflow window for the hackathon scenario:
+ *
+ *   upload and goal -> analysis -> recommendation + AI clarification
+ *   -> applying settings -> done
+ *
+ * This is intentionally a separate horizontal Window, not a full chat
+ * dashboard. AgentLogDrawer remains available for transparent MCP traces.
+ */
 Window {
     id: root
     objectName: "chatWindow"
-    title: "STE AI • 3D/5D Инженерный ассистент"
-    width: 1100
-    height: 760
-    minimumWidth: 860
-    minimumHeight: 560
-    color: "#f8fafc"
-    flags: Qt.Window
+    title: "STE Slicer · AI Assistant"
+    width: 1120
+    height: 700
+    minimumWidth: 960
+    minimumHeight: 600
+    color: "#f3f7fa"
+    flags: Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
 
-    // Material 3 Color Palette
-    readonly property color colPrimary: "#1976d2"
-    readonly property color colPrimaryHover: "#1565c0"
-    readonly property color colPrimaryPressed: "#0d47a1"
-    readonly property color colPrimaryContainer: "#e8f0fe"
-    readonly property color colOnPrimaryContainer: "#174ea6"
-    readonly property color colBackground: "#f8fafc"
-    readonly property color colSurface: "#ffffff"
-    readonly property color colSurfaceVariant: "#f1f5f9"
-    readonly property color colBorder: "#e2e8f0"
-    readonly property color colBorderHover: "#cbd5e1"
-    readonly property color colTextPrimary: "#1e293b"
-    readonly property color colTextSecondary: "#64748b"
-    readonly property color colTextTertiary: "#94a3b8"
-    readonly property color colSuccess: "#10b981"
-    readonly property color colSuccessContainer: "#ecfdf5"
-    readonly property color colWarning: "#f59e0b"
-    readonly property color colWarningContainer: "#fffbeb"
-    readonly property color colError: "#ef4444"
-    readonly property color colErrorContainer: "#fef2f2"
+    readonly property color ink: "#263746"
+    readonly property color muted: "#748694"
+    readonly property color border: "#d5e1e8"
+    readonly property color primary: "#147db8"
+    readonly property color primarySoft: "#e7f5fb"
+    readonly property color success: "#159a68"
+    readonly property color warning: "#a96d17"
+    readonly property color danger: "#c94b50"
 
-    // Safe accessor to context property 'controller'
     readonly property var activeCtrl: (typeof controller !== "undefined" && controller) ? controller : null
     readonly property var activeMgr: (typeof manager !== "undefined" && manager) ? manager : null
 
-    function sendCurrentPrompt() {
-        var ctrl = activeCtrl
-        var textVal = promptInput.text ? promptInput.text.trim() : ""
-        if (textVal.length === 0 || !ctrl) return
-        ctrl.sendPrompt(textVal)
-        promptInput.text = ""
+    property string phase: "upload"
+    property string lastError: ""
+    property string analysisTitle: "Ожидаем запуск анализа"
+    property string analysisDetail: "После запуска проверим модель и доступные режимы печати."
+    property int analysisIndex: 0
+    property int applyIndex: 0
+    property var selectedGoal: "Максимальная прочность"
+    property var goals: ["Максимальная прочность", "Быстрая печать", "Высокое качество", "Минимум поддержек"]
+    property var analysisNames: [
+        "Габариты и масштаб модели",
+        "Нависающие элементы и внутренние каналы",
+        "Печатаемость в режимах 3D / 5D",
+        "Материал и профиль принтера",
+        "Ориентация и поддержка"
+    ]
+    property var applyNames: [
+        "Режим печати",
+        "Материал",
+        "Профиль качества",
+        "Ориентация модели",
+        "Поддержки и параметры"
+    ]
+
+    property int elapsedSec: 0
+    property int finishedTools: 0
+    property var toolTitles: {
+        "analyze_mesh_geometry": "Анализ геометрии модели",
+        "select_print_mode_and_profile": "Подбор режима и профиля",
+        "modify_scene_and_parameters": "Изменение ориентации и параметров",
+        "run_slicing_and_generate_gcode": "Слайсинг и расчёт G-code",
+        "validate_and_export_artifacts": "Проверка и экспорт результата"
     }
+
+    function fileCount() {
+        return activeCtrl ? activeCtrl.modelCount : 0
+    }
+
+    function toolTitle(name) {
+        return toolTitles[name] || name || "Шаг агента"
+    }
+
+    function elapsedText() {
+        var m = Math.floor(elapsedSec / 60)
+        var s = elapsedSec % 60
+        return m + ":" + (s < 10 ? "0" : "") + s
+    }
+
+    function stepStatus(i, current) {
+        if (i < current) return "done"
+        if (i === current) return "active"
+        return "wait"
+    }
+
+    function cancelTask() {
+        if (activeCtrl) activeCtrl.cancelRequest()
+        phase = phase === "apply" ? "recommend" : "upload"
+    }
+
+    onVisibleChanged: {
+        if (visible && activeCtrl) activeCtrl.refreshPreview()
+    }
+
+    Timer {
+        interval: 1000
+        repeat: true
+        running: (root.phase === "analyze" || root.phase === "apply") && activeCtrl && activeCtrl.busy
+        onTriggered: root.elapsedSec += 1
+    }
+
+    function submitPrompt(text) {
+        if (!activeCtrl || !text || text.trim().length === 0) return
+        activeCtrl.sendPrompt(text.trim())
+    }
+
+    function startAnalysis() {
+        if (!activeCtrl || fileCount() === 0 || activeCtrl.busy) return
+        analysisIndex = 0
+        elapsedSec = 0
+        finishedTools = 0
+        changeMessages.clear()
+        analysisTitle = "Подготовка анализа"
+        analysisDetail = "Передаём модель и задачу агенту…"
+        phase = "analyze"
+        submitPrompt("Проанализируй прикреплённую модель для печати. Цель: " + selectedGoal + ". " + customGoal.text + ". Определи режим 3D/5D, материал, профиль, ориентацию, поддержки и подготовь аргументированную рекомендацию. Пока не применяй изменения, не запускай слайсинг и экспорт: используй только анализ геометрии и подбор профиля.")
+    }
+
+    function askChange(text) {
+        if (!activeCtrl || !text || text.trim().length === 0 || activeCtrl.busy) return
+        changeMessages.append({"role": "user", "text": text.trim()})
+        changeInput.text = ""
+        submitPrompt("Измени текущую рекомендацию по запросу пользователя: " + text.trim() + ". Верни обновлённые параметры и объясни последствия, но не применяй их пока.")
+    }
+
+    function applyRecommendation() {
+        if (!activeCtrl || activeCtrl.busy) return
+        applyIndex = 0
+        elapsedSec = 0
+        phase = "apply"
+        submitPrompt("Примени текущую подтверждённую рекомендацию к STE Slicer: режим печати, материал, профиль, ориентацию модели, поддержки и параметры. Не запускай слайсинг. После применения сообщи результат.")
+    }
+
+    function setAnalysisStep(toolName) {
+        if (phase !== "analyze") return
+        analysisIndex = Math.min(4, analysisIndex + 1)
+        analysisTitle = toolTitle(toolName)
+        analysisDetail = "Выполняется MCP-инструмент " + toolName
+    }
+
+    function finishPhase(text) {
+        if (phase === "analyze") {
+            analysisIndex = 5
+            if (text) changeMessages.append({"role": "assistant", "text": text})
+            phase = "recommend"
+        } else if (phase === "apply") {
+            applyIndex = 5
+            phase = "done"
+        } else if (phase === "recommend" && text) {
+            changeMessages.append({"role": "assistant", "text": text})
+        }
+    }
+
+    function setApplyStep(label) {
+        if (phase !== "apply") return
+        applyIndex = Math.min(4, applyIndex + 1)
+    }
+
+    function resetToUpload() {
+        if (activeCtrl && !activeCtrl.busy) activeCtrl.clearConversation()
+        phase = "upload"
+        lastError = ""
+        analysisIndex = 0
+        applyIndex = 0
+    }
+
+    FileDialog {
+        id: modelDialog
+        title: "Выберите 3D-модель"
+        selectMultiple: true
+        nameFilters: ["3D-модели (*.stl *.obj *.3mf)", "Все поддерживаемые файлы (*.stl *.obj *.3mf)"]
+        onAccepted: {
+            if (activeCtrl) {
+                for (var i = 0; i < fileUrls.length; i++) activeCtrl.addAttachment(fileUrls[i].toString())
+            }
+        }
+    }
+
+    ListModel { id: changeMessages }
 
     Connections {
         target: activeCtrl
+
         onMessageAdded: {
-            messageList.positionViewAtEnd()
+            // The workflow screens intentionally do not expose the full
+            // conversation list. Detailed messages remain available in the
+            // agent log and in the controller's MessageListModel.
         }
         onTaskStarted: {
-            statusBadgeText.text = "Агент выполняет нарезку..."
-            statusBadgeDot.color = root.colWarning
+            if (root.phase === "analyze") {
+                root.analysisTitle = "Запущен анализ модели"
+                root.analysisDetail = "Агент собирает данные о геометрии…"
+            } else if (root.phase === "apply") {
+                root.analysisTitle = "Применяем настройки"
+            }
         }
+        // toolStarted(toolName, callId): the second argument is an opaque
+        // call id like "call_624a…", so only the tool name is shown.
+        onToolStarted: {
+            if (root.phase === "analyze") root.setAnalysisStep(arguments[0])
+            if (root.phase === "apply") root.setApplyStep(arguments[0])
+        }
+        onToolFinished: {
+            root.finishedTools += 1
+            if (root.phase === "analyze") root.analysisDetail = "Агент обдумывает результаты и выбирает следующий шаг…"
+        }
+        onResponseReady: root.finishPhase(arguments[0])
+        // An empty final answer emits only taskFinished; without this the
+        // window stayed on the analysis screen forever.
         onTaskFinished: {
-            statusBadgeText.text = (activeCtrl && activeCtrl.connected) ? "Слайсер подключён" : "Готов к работе"
-            statusBadgeDot.color = root.colSuccess
+            if (root.phase === "analyze" || root.phase === "apply") root.finishPhase("")
         }
         onTaskFailed: {
-            statusBadgeText.text = "Ошибка обработки"
-            statusBadgeDot.color = root.colError
-        }
-        onConnectedChanged: {
-            if (activeCtrl && activeCtrl.connected) {
-                statusBadgeText.text = "Слайсер подключён"
-                statusBadgeDot.color = root.colSuccess
-            } else {
-                statusBadgeText.text = "Офлайн"
-                statusBadgeDot.color = root.colTextTertiary
-            }
+            root.lastError = arguments[0] || "Не удалось выполнить операцию."
+            root.phase = "error"
         }
     }
 
-    ColumnLayout {
-        anchors.fill: parent
-        spacing: 0
+    Rectangle {
+        id: header
+        anchors.top: parent.top
+        width: parent.width
+        height: 62
+        color: "#ffffff"
+        border.color: root.border
 
-        // =====================================================================
-        // 1. MATERIAL APP BAR (HEADER)
-        // =====================================================================
-        Rectangle {
-            id: header
-            Layout.fillWidth: true
-            Layout.preferredHeight: 64
-            color: root.colSurface
-            border.color: root.colBorder
-            border.width: 1
-            z: 10
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 24
+            anchors.rightMargin: 18
+            spacing: 12
 
-            RowLayout {
-                anchors.fill: parent
-                anchors.leftMargin: 20
-                anchors.rightMargin: 16
-                spacing: 12
-
-                // Logo Badge
-                Rectangle {
-                    width: 38
-                    height: 38
-                    radius: 10
-                    gradient: Gradient {
-                        GradientStop { position: 0.0; color: "#2563eb" }
-                        GradientStop { position: 1.0; color: "#1d4ed8" }
-                    }
-                    Text {
-                        anchors.centerIn: parent
-                        text: "5D"
-                        color: "#ffffff"
-                        font.bold: true
-                        font.pixelSize: 15
-                    }
-                }
-
-                // Title & Subtitle
-                Column {
-                    spacing: 2
-                    Row {
-                        spacing: 6
-                        Text {
-                            text: "STE AI"
-                            font.bold: true
-                            font.pixelSize: 16
-                            color: root.colTextPrimary
-                        }
-                        Text {
-                            text: "•  3D/5D Инженерный ассистент"
-                            font.pixelSize: 14
-                            color: root.colTextSecondary
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                    Text {
-                        text: "Stereotech Slicer  |  Автономная оптимизация и ReAct-нарезка"
-                        font.pixelSize: 10
-                        color: root.colTextTertiary
-                    }
-                }
-
-                Item { Layout.fillWidth: true }
-
-                // Live Status Badge
-                Rectangle {
-                    height: 30
-                    radius: 15
-                    color: root.colSurfaceVariant
-                    border.color: root.colBorder
-                    border.width: 1
-                    implicitWidth: statusRow.width + 20
-
-                    Row {
-                        id: statusRow
-                        anchors.centerIn: parent
-                        spacing: 7
-                        Rectangle {
-                            id: statusBadgeDot
-                            width: 8
-                            height: 8
-                            radius: 4
-                            color: (activeCtrl && activeCtrl.connected) ? root.colSuccess : root.colWarning
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                        Text {
-                            id: statusBadgeText
-                            text: (activeCtrl && activeCtrl.connected) ? "Слайсер подключён" : "Подключение к слайсеру..."
-                            color: root.colTextSecondary
-                            font.pixelSize: 11
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                }
-
-                // Settings Button
-                Rectangle {
-                    width: 108
-                    height: 34
-                    radius: 8
-                    color: settingsBtnMouse.containsMouse ? root.colSurfaceVariant : "transparent"
-                    border.color: settingsBtnMouse.containsMouse ? root.colBorderHover : root.colBorder
-                    border.width: 1
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: 6
-                        Text { text: "⚙"; font.pixelSize: 14; color: root.colTextPrimary }
-                        Text { text: "Настройки"; font.pixelSize: 12; font.weight: Font.Medium; color: root.colTextPrimary }
-                    }
-
-                    MouseArea {
-                        id: settingsBtnMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            if (activeMgr && activeMgr.showSettingsDialog) {
-                                activeMgr.showSettingsDialog()
-                            } else if (activeCtrl && activeCtrl.openSettings) {
-                                activeCtrl.openSettings()
-                            }
-                        }
-                    }
-                }
-
-                // Log Drawer Button
-                Rectangle {
-                    width: 114
-                    height: 34
-                    radius: 8
-                    color: logDrawer.opened ? root.colPrimary : (logBtnMouse.containsMouse ? root.colPrimaryContainer : root.colSurfaceVariant)
-                    border.color: logDrawer.opened ? root.colPrimary : root.colBorder
-                    border.width: 1
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: 6
-                        Text {
-                            text: "📋"
-                            font.pixelSize: 13
-                            color: logDrawer.opened ? "#ffffff" : (logBtnMouse.containsMouse ? root.colPrimary : root.colTextSecondary)
-                        }
-                        Text {
-                            text: "Лог агента"
-                            font.pixelSize: 12
-                            font.weight: Font.Medium
-                            color: logDrawer.opened ? "#ffffff" : (logBtnMouse.containsMouse ? root.colPrimary : root.colTextPrimary)
-                        }
-                    }
-
-                    MouseArea {
-                        id: logBtnMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: logDrawer.opened = !logDrawer.opened
-                    }
-                }
-
-                // =================================================================
-                // PROMINENT CLOSE WINDOW BUTTON (User Requirement)
-                // =================================================================
-                Rectangle {
-                    id: closeWindowBtn
-                    width: 34
-                    height: 34
-                    radius: 17
-                    color: closeWinMouse.containsMouse ? root.colErrorContainer : root.colSurfaceVariant
-                    border.color: closeWinMouse.containsMouse ? "#fca5a5" : root.colBorder
-                    border.width: 1
-
-                    Text {
-                        anchors.centerIn: parent
-                        text: "✕"
-                        font.pixelSize: 14
-                        font.bold: true
-                        color: closeWinMouse.containsMouse ? root.colError : root.colTextSecondary
-                    }
-
-                    MouseArea {
-                        id: closeWinMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.close()
-                    }
-                }
+            Text { text: "✣"; color: root.primary; font.pixelSize: 28 }
+            Column {
+                spacing: 2
+                Text { text: "slicer assistant"; color: "#526b7d"; font.pixelSize: 20 }
+                Text { text: "STE Slicer · подготовка печати"; color: root.muted; font.pixelSize: 10 }
             }
-        }
-
-        // =====================================================================
-        // 2. SCENE CONTEXT BAR (Printer & Slicing Status)
-        // =====================================================================
-        Rectangle {
-            id: sceneBar
-            Layout.fillWidth: true
-            Layout.preferredHeight: 42
-            color: root.colSurfaceVariant
-            border.color: root.colBorder
-            border.width: 1
-
-            RowLayout {
-                anchors.fill: parent
-                anchors.leftMargin: 20
-                anchors.rightMargin: 16
-                spacing: 16
-
-                // Printer Chip
+            Item { Layout.fillWidth: true }
+            Rectangle {
+                height: 28
+                radius: 14
+                color: "#f2faf6"
+                border.color: "#bfe6d3"
+                implicitWidth: statusText.width + 30
                 Row {
-                    spacing: 6
-                    Text { text: "🖨"; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter }
-                    Text {
-                        text: "Принтер: <b>" + (activeCtrl ? activeCtrl.printerName : "Stereotech Hybrid 530") + "</b>"
-                        textFormat: Text.RichText
-                        color: root.colTextPrimary
-                        font.pixelSize: 11
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-
-                // Mode Chip (Pill badge)
-                Rectangle {
-                    height: 24
-                    radius: 6
-                    color: (activeCtrl && activeCtrl.printMode === "5D") ? root.colPrimary : "#e2e8f0"
-                    implicitWidth: modeRow.width + 14
-                    Row {
-                        id: modeRow
-                        anchors.centerIn: parent
-                        spacing: 4
-                        Text {
-                            text: "Режим: " + (activeCtrl ? activeCtrl.printMode : "3D")
-                            font.bold: true
-                            font.pixelSize: 10
-                            color: (activeCtrl && activeCtrl.printMode === "5D") ? "#ffffff" : root.colTextPrimary
-                        }
-                    }
-                }
-
-                // Material Chip
-                Row {
-                    spacing: 6
-                    Text { text: "🧶"; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter }
-                    Text {
-                        text: "Материал: <b>" + (activeCtrl ? activeCtrl.material : "Не выбран") + "</b>"
-                        textFormat: Text.RichText
-                        color: root.colTextPrimary
-                        font.pixelSize: 11
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-
-                // Models Count
-                Row {
-                    spacing: 6
-                    Text { text: "🧊"; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter }
-                    Text {
-                        text: "Моделей на столе: <b>" + (activeCtrl ? activeCtrl.modelCount : 0) + "</b>"
-                        textFormat: Text.RichText
-                        color: root.colTextPrimary
-                        font.pixelSize: 11
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-
-                // Slicing result stats (if available)
-                Row {
-                    visible: activeCtrl ? (activeCtrl.printTime.length > 0) : false
-                    spacing: 6
-                    Text { text: "⏱"; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter }
-                    Text {
-                        text: "Время: <b>" + (activeCtrl ? activeCtrl.printTime : "") + "</b>"
-                        textFormat: Text.RichText
-                        color: "#047857"
-                        font.pixelSize: 11
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-
-                Item { Layout.fillWidth: true }
-
-                // Clear Conversation Button
-                Rectangle {
-                    width: 104
-                    height: 26
-                    radius: 6
-                    color: clearBtnMouse.containsMouse ? "#fee2e2" : "transparent"
-                    border.color: clearBtnMouse.containsMouse ? "#fca5a5" : "transparent"
-                    border.width: 1
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: 5
-                        Text { text: "🗑"; font.pixelSize: 11 }
-                        Text {
-                            text: "Очистить чат"
-                            font.pixelSize: 11
-                            color: clearBtnMouse.containsMouse ? root.colError : root.colTextSecondary
-                        }
-                    }
-
-                    MouseArea {
-                        id: clearBtnMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            if (activeCtrl && !activeCtrl.busy) {
-                                activeCtrl.clearConversation()
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // =====================================================================
-        // 3. CHAT MESSAGES LIST (FIXED ROBUST VERTICAL LAYOUT)
-        // =====================================================================
-        Item {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-
-            ListView {
-                id: messageList
-                anchors.fill: parent
-                anchors.margins: 16
-                clip: true
-                spacing: 12
-                model: activeCtrl ? activeCtrl.messageModel : null
-
-                delegate: Item {
-                    id: msgDelegate
-                    width: messageList.width
-                    height: contentWrapper.height + 6
-
-                    Item {
-                        id: contentWrapper
-                        width: parent.width
-                        height: {
-                            if (model.kind === "user") return userCard.height
-                            if (model.kind === "tool_trace") return toolCard.height
-                            if (model.kind === "system") return systemCard.height
-                            return assistantCard.height
-                        }
-
-                        // -------------------------------------------------------------
-                        // USER MESSAGE (Floats to Right)
-                        // -------------------------------------------------------------
-                        Rectangle {
-                            id: userCard
-                            visible: model.kind === "user"
-                            anchors.right: parent.right
-                            anchors.rightMargin: 8
-                            width: Math.min(parent.width * 0.75, 680)
-                            height: userCol.childrenRect.height + 20
-                            radius: 12
-                            color: root.colPrimaryContainer
-                            border.color: "#bfdbfe"
-                            border.width: 1
-
-                            Column {
-                                id: userCol
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.top: parent.top
-                                anchors.margins: 10
-                                spacing: 4
-
-                                RowLayout {
-                                    width: parent.width
-                                    spacing: 6
-                                    Text { text: "👤"; font.pixelSize: 11 }
-                                    Text { text: "Вы"; font.bold: true; font.pixelSize: 11; color: root.colOnPrimaryContainer }
-                                    Item { Layout.fillWidth: true }
-                                    Text { text: model.timestamp || ""; font.pixelSize: 10; color: root.colTextTertiary }
-                                }
-
-                                Text {
-                                    width: parent.width
-                                    text: model.text || ""
-                                    wrapMode: Text.Wrap
-                                    font.pixelSize: 13
-                                    lineHeight: 1.25
-                                    color: root.colOnPrimaryContainer
-                                }
-                            }
-                        }
-
-                        // -------------------------------------------------------------
-                        // ASSISTANT MESSAGE (Floats to Left)
-                        // -------------------------------------------------------------
-                        Rectangle {
-                            id: assistantCard
-                            visible: model.kind === "assistant"
-                            anchors.left: parent.left
-                            anchors.leftMargin: 8
-                            width: Math.min(parent.width * 0.82, 780)
-                            height: assistantCol.childrenRect.height + 24
-                            radius: 12
-                            color: root.colSurface
-                            border.color: root.colBorder
-                            border.width: 1
-
-                            Column {
-                                id: assistantCol
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.top: parent.top
-                                anchors.margins: 12
-                                spacing: 6
-
-                                RowLayout {
-                                    width: parent.width
-                                    spacing: 6
-                                    Rectangle {
-                                        width: 20; height: 20; radius: 10
-                                        color: "#2563eb"
-                                        Text { anchors.centerIn: parent; text: "✦"; color: "#ffffff"; font.pixelSize: 10 }
-                                    }
-                                    Text { text: "STE AI Инженер"; font.bold: true; font.pixelSize: 12; color: root.colPrimary }
-                                    Item { Layout.fillWidth: true }
-                                    Text { text: model.timestamp || ""; font.pixelSize: 10; color: root.colTextTertiary }
-                                }
-
-                                Text {
-                                    width: parent.width
-                                    text: model.text || ""
-                                    wrapMode: Text.Wrap
-                                    font.pixelSize: 13
-                                    lineHeight: 1.3
-                                    color: root.colTextPrimary
-                                }
-                            }
-                        }
-
-                        // -------------------------------------------------------------
-                        // TOOL TRACE (Compact, Expandable & Dismissible)
-                        // -------------------------------------------------------------
-                        Rectangle {
-                            id: toolCard
-                            visible: model.kind === "tool_trace"
-                            property bool expanded: false
-                            anchors.left: parent.left
-                            anchors.leftMargin: 8
-                            width: Math.min(parent.width * 0.88, 800)
-                            height: toolCol.childrenRect.height + 16
-                            radius: 8
-                            color: model.status === "err" || model.status === "error" ? "#fef2f2" : "#f8fafc"
-                            border.color: model.status === "err" || model.status === "error" ? "#fca5a5" : "#e2e8f0"
-                            border.width: 1
-
-                            Column {
-                                id: toolCol
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.top: parent.top
-                                anchors.margins: 8
-                                spacing: 6
-
-                                // Header row (Always 1 clean compact line!)
-                                RowLayout {
-                                    width: parent.width
-                                    spacing: 8
-
-                                    Text { text: "⚡"; font.pixelSize: 12 }
-                                    Text {
-                                        text: model.text || model.toolName || "Вызов инструмента"
-                                        font.bold: true
-                                        font.pixelSize: 11
-                                        color: "#0f172a"
-                                        Layout.fillWidth: true
-                                        elide: Text.ElideRight
-                                    }
-
-                                    // Status Badge
-                                    Rectangle {
-                                        height: 20
-                                        radius: 4
-                                        color: model.status === "ok" ? "#ecfdf5" : ((model.status === "err" || model.status === "error") ? "#fee2e2" : "#fffbeb")
-                                        border.color: model.status === "ok" ? "#a7f3d0" : ((model.status === "err" || model.status === "error") ? "#fca5a5" : "#fde68a")
-                                        border.width: 1
-                                        implicitWidth: toolBadgeText.width + 10
-
-                                        Text {
-                                            id: toolBadgeText
-                                            anchors.centerIn: parent
-                                            text: model.status === "ok" ? "✓ Успешно" : ((model.status === "err" || model.status === "error") ? "✕ Ошибка" : "⟳ В процессе")
-                                            font.bold: true
-                                            font.pixelSize: 9
-                                            color: model.status === "ok" ? "#065f46" : ((model.status === "err" || model.status === "error") ? "#991b1b" : "#92400e")
-                                        }
-                                    }
-
-                                    // Duration
-                                    Text {
-                                        visible: model.durationMs > 0
-                                        text: model.durationMs + " ms"
-                                        font.pixelSize: 10
-                                        color: "#64748b"
-                                    }
-
-                                    // Toggle Expand Button (▼ / ▲)
-                                    Rectangle {
-                                        width: 22; height: 22; radius: 4
-                                        color: toggleExpandMouse.containsMouse ? "#e2e8f0" : "transparent"
-                                        Text {
-                                            anchors.centerIn: parent
-                                            text: toolCard.expanded ? "▲" : "▼"
-                                            font.pixelSize: 9
-                                            color: "#64748b"
-                                        }
-                                        MouseArea {
-                                            id: toggleExpandMouse
-                                            anchors.fill: parent
-                                            hoverEnabled: true
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: toolCard.expanded = !toolCard.expanded
-                                        }
-                                    }
-
-                                    // Dismiss / Close Button (✕)
-                                    Rectangle {
-                                        width: 22; height: 22; radius: 11
-                                        color: dismissToolMouse.containsMouse ? "#fee2e2" : "transparent"
-                                        Text {
-                                            anchors.centerIn: parent
-                                            text: "✕"
-                                            font.pixelSize: 10
-                                            color: dismissToolMouse.containsMouse ? "#ef4444" : "#94a3b8"
-                                        }
-                                        MouseArea {
-                                            id: dismissToolMouse
-                                            anchors.fill: parent
-                                            hoverEnabled: true
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: toolCard.visible = false
-                                        }
-                                    }
-                                }
-
-                                // Expandable Details (ONLY when expanded = true!)
-                                Rectangle {
-                                    visible: toolCard.expanded && (model.toolArguments.length > 0 || model.toolResult.length > 0)
-                                    width: parent.width
-                                    height: Math.min(toolDetailsText.implicitHeight + 12, 160)
-                                    radius: 6
-                                    color: "#0f172a"
-                                    clip: true
-
-                                    Flickable {
-                                        anchors.fill: parent
-                                        anchors.margins: 6
-                                        contentWidth: toolDetailsText.width
-                                        contentHeight: toolDetailsText.height
-                                        clip: true
-
-                                        Text {
-                                            id: toolDetailsText
-                                            text: (model.toolArguments.length > 0 ? "Параметры:\n" + model.toolArguments : "") +
-                                                  (model.toolResult.length > 0 ? "\n\nРезультат:\n" + model.toolResult : "")
-                                            color: "#38bdf8"
-                                            font.family: "Consolas, 'Courier New', monospace"
-                                            font.pixelSize: 10
-                                            wrapMode: Text.Wrap
-                                            width: toolCard.width - 30
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // -------------------------------------------------------------
-                        // SYSTEM MESSAGE (Compact Centered Pill)
-                        // -------------------------------------------------------------
-                        Rectangle {
-                            id: systemCard
-                            visible: model.kind === "system"
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            width: Math.min(systemText.implicitWidth + 24, parent.width * 0.9)
-                            height: systemText.implicitHeight + 10
-                            radius: 12
-                            color: model.status === "error" ? "#fef2f2" : "#f1f5f9"
-                            border.color: model.status === "error" ? "#fca5a5" : "#e2e8f0"
-                            border.width: 1
-
-                            Text {
-                                id: systemText
-                                anchors.centerIn: parent
-                                text: model.text || ""
-                                font.pixelSize: 11
-                                color: model.status === "error" ? "#991b1b" : "#475569"
-                                wrapMode: Text.Wrap
-                                width: Math.min(implicitWidth, parent.width - 24)
-                            }
-                        }
-                    }
-                }
-
-                // Welcome Empty State
-                Item {
                     anchors.centerIn: parent
-                    visible: messageList.count === 0
-                    width: Math.min(parent.width * 0.8, 620)
-                    height: emptyCol.height
-
-                    Column {
-                        id: emptyCol
-                        width: parent.width
-                        spacing: 12
-                        anchors.horizontalCenter: parent.horizontalCenter
-
-                        Rectangle {
-                            width: 60
-                            height: 60
-                            radius: 30
-                            color: root.colPrimaryContainer
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            Text {
-                                anchors.centerIn: parent
-                                text: "✦"
-                                font.pixelSize: 26
-                                color: root.colPrimary
-                            }
-                        }
-
-                        Text {
-                            text: "Добро пожаловать в STE AI Ассистент!"
-                            font.bold: true
-                            font.pixelSize: 18
-                            color: root.colTextPrimary
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-
-                        Text {
-                            text: "ИИ-инженер для автоматической подготовки и нарезки моделей под 3D и 5D печать."
-                            font.pixelSize: 13
-                            color: root.colTextSecondary
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-
-                        Rectangle {
-                            width: parent.width
-                            height: 1
-                            color: root.colBorder
-                        }
-
-                        Grid {
-                            columns: 2
-                            spacing: 12
-                            width: parent.width
-                            anchors.horizontalCenter: parent.horizontalCenter
-
-                            Rectangle {
-                                width: (parent.width - 12) / 2
-                                height: 58
-                                radius: 8
-                                color: root.colSurface
-                                border.color: root.colBorder
-                                border.width: 1
-                                Row {
-                                    anchors.fill: parent
-                                    anchors.margins: 10
-                                    spacing: 8
-                                    Text { text: "📎"; font.pixelSize: 18; anchors.verticalCenter: parent.verticalCenter }
-                                    Column {
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        Text { text: "1. Прикрепите модель"; font.bold: true; font.pixelSize: 11; color: root.colTextPrimary }
-                                        Text { text: "STL, OBJ или 3MF деталь"; font.pixelSize: 10; color: root.colTextSecondary }
-                                    }
-                                }
-                            }
-
-                            Rectangle {
-                                width: (parent.width - 12) / 2
-                                height: 58
-                                radius: 8
-                                color: root.colSurface
-                                border.color: root.colBorder
-                                border.width: 1
-                                Row {
-                                    anchors.fill: parent
-                                    anchors.margins: 10
-                                    spacing: 8
-                                    Text { text: "💬"; font.pixelSize: 18; anchors.verticalCenter: parent.verticalCenter }
-                                    Column {
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        Text { text: "2. Опишите задачу"; font.bold: true; font.pixelSize: 11; color: root.colTextPrimary }
-                                        Text { text: "Материал, нагрузки, поддержки"; font.pixelSize: 10; color: root.colTextSecondary }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    spacing: 7
+                    Rectangle { width: 7; height: 7; radius: 4; color: activeCtrl && activeCtrl.connected ? root.success : root.warning; anchors.verticalCenter: parent.verticalCenter }
+                    Text { id: statusText; text: activeCtrl && activeCtrl.connected ? "STE Slicer подключен" : "Подключение…"; color: root.muted; font.pixelSize: 11 }
                 }
             }
+            Button { text: "Настройки"; onClicked: { if (activeMgr) activeMgr.showSettingsDialog() } }
+            Button { text: "×"; onClicked: root.close() }
         }
+    }
 
-        // =====================================================================
-        // 4. QUICK PROMPT SUGGESTION CHIPS
-        // =====================================================================
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 38
-            color: root.colBackground
-
-            Row {
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.left: parent.left
-                anchors.leftMargin: 20
-                spacing: 8
-
-                Repeater {
-                    model: [
-                        { label: "🎯 Кронштейн под нагрузку", prompt: "Кронштейн под нагрузку, PETG, максимальная прочность" },
-                        { label: "⚡ Без поддержек", prompt: "Ориентировать деталь для печати без поддержек" },
-                        { label: "🔄 Подготовить 5D нарезку", prompt: "Выбрать режим 5D печати, рассчитать траектории и нарезать" },
-                        { label: "📐 Анализ геометрии", prompt: "Проанализировать геометрию детали, габариты и нависания" }
-                    ]
-                    delegate: Rectangle {
-                        height: 28
-                        radius: 14
-                        color: chipMouse.containsMouse ? root.colPrimaryContainer : root.colSurface
-                        border.color: chipMouse.containsMouse ? "#bfdbfe" : root.colBorder
-                        border.width: 1
-                        implicitWidth: chipText.width + 20
-
-                        Text {
-                            id: chipText
-                            anchors.centerIn: parent
-                            text: modelData.label
-                            font.pixelSize: 11
-                            color: chipMouse.containsMouse ? root.colPrimary : root.colTextPrimary
-                        }
-
-                        MouseArea {
-                            id: chipMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: promptInput.text = modelData.prompt
-                        }
-                    }
-                }
-            }
+    Rectangle {
+        id: contextBar
+        anchors.top: header.bottom
+        width: parent.width
+        height: 42
+        color: "#edf5f9"
+        border.color: root.border
+        Row {
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.left: parent.left
+            anchors.leftMargin: 24
+            spacing: 22
+            Text { text: "Принтер: " + (activeCtrl ? activeCtrl.printerName : "Stereotech Hybrid 530"); color: root.ink; font.pixelSize: 11 }
+            Text { text: "Режим: " + (activeCtrl ? activeCtrl.printMode : "3D"); color: root.ink; font.pixelSize: 11 }
+            Text { text: "Материал: " + (activeCtrl ? activeCtrl.material : "не выбран"); color: root.ink; font.pixelSize: 11 }
+            Text { text: "Моделей: " + fileCount(); color: root.ink; font.pixelSize: 11 }
         }
+    }
 
-        // =====================================================================
-        // 5. ATTACHMENT BAR (DRAG & DROP + CHIPS)
-        // =====================================================================
-        AttachmentBar {
-            id: attachments
-            Layout.fillWidth: true
-            controller: root.activeCtrl
-            attachmentModel: activeCtrl ? activeCtrl.attachmentModel : null
-        }
+    Item {
+        id: body
+        anchors.top: contextBar.bottom
+        anchors.bottom: parent.bottom
+        width: parent.width
 
-        // =====================================================================
-        // 6. PROMPT INPUT BAR
-        // =====================================================================
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 90
-            Layout.margins: 16
-            Layout.topMargin: 4
-            color: root.colSurface
-            border.color: promptInput.activeFocus ? root.colPrimary : root.colBorder
-            border.width: promptInput.activeFocus ? 2 : 1
-            radius: 12
+        // ---------------------------------------------------------------
+        // 1. MODEL + GOAL
+        // ---------------------------------------------------------------
+        Item {
+            anchors.fill: parent
+            visible: root.phase === "upload"
 
-            ColumnLayout {
+            Column {
                 anchors.fill: parent
-                anchors.margins: 8
-                spacing: 4
+                anchors.margins: 28
+                spacing: 12
 
-                // Busy progress indicator
-                Rectangle {
-                    visible: activeCtrl ? activeCtrl.busy : false
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 3
-                    radius: 1.5
-                    color: root.colPrimaryContainer
-                    clip: true
+                Text { text: "Подготовим модель к печати"; color: root.ink; font.pixelSize: 24; font.bold: true }
+                Text { text: "Загрузите модель и укажите, что важно получить. Ассистент подберёт настройки, но ничего не применит без вашего подтверждения."; color: root.muted; font.pixelSize: 12 }
+
+                Row {
+                    width: parent.width
+                    height: parent.height - 135
+                    spacing: 22
 
                     Rectangle {
-                        id: busyIndicatorBar
-                        width: 120
+                        width: parent.width * 0.52
                         height: parent.height
-                        color: root.colPrimary
-                        radius: 1.5
+                        radius: 10
+                        color: dropArea.containsDrag ? "#e7f5fb" : "#fbfdfe"
+                        border.color: dropArea.containsDrag ? root.primary : "#9ebdce"
+                        border.width: dropArea.containsDrag ? 2 : 1
 
-                        NumberAnimation on x {
-                            running: activeCtrl ? activeCtrl.busy : false
-                            from: -120
-                            to: busyIndicatorBar.parent ? busyIndicatorBar.parent.width : 500
-                            duration: 1200
-                            loops: Animation.Infinite
+                        Column {
+                            anchors.centerIn: parent
+                            spacing: 9
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "⇧"; color: root.primary; font.pixelSize: 38 }
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Перетащите 3D-модель сюда"; color: root.ink; font.pixelSize: 16; font.bold: true }
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "или"; color: root.muted; font.pixelSize: 11 }
+                            Button { anchors.horizontalCenter: parent.horizontalCenter; text: "Выбрать файл"; onClicked: modelDialog.open() }
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "STL · OBJ · 3MF"; color: root.muted; font.pixelSize: 10 }
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; visible: fileCount() > 0; text: "Моделей готово к анализу: " + fileCount(); color: root.success; font.pixelSize: 11 }
                         }
+                        DropArea {
+                            id: dropArea
+                            anchors.fill: parent
+                            onDropped: {
+                                if (drop.hasUrls && activeCtrl) {
+                                    for (var i = 0; i < drop.urls.length; i++) activeCtrl.addAttachment(drop.urls[i].toString())
+                                }
+                            }
+                        }
+                    }
+
+                    Column {
+                        width: parent.width * 0.48 - 22
+                        height: parent.height
+                        spacing: 10
+                        Text { text: "Цель печати"; color: root.ink; font.pixelSize: 14; font.bold: true }
+                        Text { text: "Выберите вариант или сформулируйте задачу своими словами"; color: root.muted; font.pixelSize: 10 }
+                        Grid {
+                            columns: 2
+                            spacing: 8
+                            width: parent.width
+                            Repeater {
+                                model: root.goals
+                                delegate: Rectangle {
+                                    width: (parent.width - 8) / 2
+                                    height: 58
+                                    radius: 7
+                                    color: root.selectedGoal === modelData ? root.primarySoft : "#ffffff"
+                                    border.color: root.selectedGoal === modelData ? root.primary : root.border
+                                    Text { anchors.centerIn: parent; text: modelData; color: root.selectedGoal === modelData ? root.primary : root.ink; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; width: parent.width - 10; wrapMode: Text.Wrap }
+                                    MouseArea { anchors.fill: parent; onClicked: root.selectedGoal = modelData }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: parent.width
+                            height: 76
+                            radius: 7
+                            color: "#ffffff"
+                            border.color: customGoal.activeFocus ? root.primary : root.border
+                            Text { anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 10; text: "✦"; color: root.warning; font.pixelSize: 17 }
+                            TextArea { id: customGoal; anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.leftMargin: 34; anchors.rightMargin: 8; anchors.topMargin: 8; anchors.bottomMargin: 5; frameVisible: false; wrapMode: TextEdit.Wrap; font.pixelSize: 11 }
+                            Text { anchors.left: parent.left; anchors.top: parent.top; anchors.leftMargin: 38; anchors.topMargin: 12; visible: customGoal.text.length === 0 && !customGoal.activeFocus; text: "Например: кронштейн под нагрузку, PETG, без поддержек"; color: root.muted; font.pixelSize: 11 }
+                        }
+                        AttachmentBar { width: parent.width; controller: root.activeCtrl; attachmentModel: activeCtrl ? activeCtrl.attachmentModel : null }
                     }
                 }
-
+            }
+            Rectangle {
+                anchors.bottom: parent.bottom
+                width: parent.width
+                height: 61
+                color: "#ffffff"
+                border.color: root.border
                 RowLayout {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    spacing: 10
+                    anchors.fill: parent
+                    anchors.leftMargin: 28
+                    anchors.rightMargin: 28
+                    Text { text: "AI сначала проанализирует модель и покажет рекомендации"; color: root.muted; font.pixelSize: 10; Layout.fillWidth: true }
+                    Button { text: "Проанализировать модель  →"; enabled: fileCount() > 0 && !(activeCtrl && activeCtrl.busy); onClicked: root.startAnalysis() }
+                }
+            }
+        }
 
-                    Item {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-
-                        TextArea {
-                            id: promptInput
+        // ---------------------------------------------------------------
+        // 2. ANALYSIS
+        // ---------------------------------------------------------------
+        Item {
+            anchors.fill: parent
+            anchors.margins: 28
+            visible: root.phase === "analyze"
+            Column {
+                anchors.fill: parent
+                spacing: 16
+                Text { text: "Анализируем модель"; color: root.ink; font.pixelSize: 24; font.bold: true }
+                Text { text: "Ассистент проверяет конкретные ограничения детали и принтера перед подбором профиля."; color: root.muted; font.pixelSize: 12 }
+                Row {
+                    width: parent.width
+                    height: parent.height - 95
+                    spacing: 20
+                    Rectangle {
+                        width: parent.width * 0.42
+                        height: parent.height
+                        radius: 9
+                        color: "#ffffff"
+                        border.color: root.border
+                        Column {
                             anchors.fill: parent
-                            wrapMode: TextEdit.Wrap
-                            font.pixelSize: 13
-                            textColor: root.colTextPrimary
-                            frameVisible: false
-
-                            Keys.onPressed: {
-                                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                                    if (event.modifiers & Qt.ShiftModifier) {
-                                        // Shift+Enter inserts newline
-                                        return
-                                    }
-                                    root.sendCurrentPrompt()
-                                    event.accepted = true
-                                }
+                            spacing: 0
+                            Text { text: "ПРЕДПРОСМОТР МОДЕЛИ"; color: root.muted; font.pixelSize: 10; anchors.left: parent.left; anchors.margins: 14; height: 34; verticalAlignment: Text.AlignVCenter }
+                            ModelPreview {
+                                width: parent.width
+                                height: parent.height - 72
+                                controller: root.activeCtrl
                             }
-                        }
-
-                        Text {
-                            anchors.fill: parent
-                            anchors.margins: 4
-                            text: "Опишите задачу печати (Enter для отправки, Shift+Enter для новой строки)…"
-                            color: root.colTextTertiary
-                            font.pixelSize: 13
-                            visible: promptInput.text.length === 0 && !promptInput.activeFocus
+                            Text { text: activeCtrl && activeCtrl.modelInfo ? activeCtrl.modelInfo : "Габариты будут определены агентом"; color: root.muted; font.pixelSize: 10; width: parent.width - 20; anchors.horizontalCenter: parent.horizontalCenter; height: 38; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight; maximumLineCount: 2; wrapMode: Text.Wrap }
                         }
                     }
-
-                    // Action buttons
-                    Column {
-                        spacing: 6
-                        Layout.alignment: Qt.AlignBottom
-
-                        // Send Button
-                        Rectangle {
-                            width: 110
-                            height: 38
-                            radius: 8
-                            color: {
-                                if (activeCtrl && activeCtrl.busy) return "#94a3b8"
-                                if (promptInput.text.trim().length === 0) return "#94a3b8"
-                                return sendMouse.containsMouse ? root.colPrimaryHover : root.colPrimary
+                    Rectangle {
+                        width: parent.width * 0.58 - 20
+                        height: parent.height
+                        radius: 9
+                        color: "#ffffff"
+                        border.color: root.border
+                        Column {
+                            anchors.fill: parent
+                            anchors.margins: 20
+                            spacing: 12
+                            Item {
+                                width: parent.width
+                                height: 22
+                                StepIcon { id: headIcon; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; status: activeCtrl && activeCtrl.busy ? "active" : "done"; activeColor: root.primary; doneColor: root.success }
+                                Text { anchors.left: headIcon.right; anchors.leftMargin: 8; anchors.right: percentText.left; anchors.rightMargin: 10; anchors.verticalCenter: parent.verticalCenter; text: root.analysisTitle; color: root.ink; font.pixelSize: 14; font.bold: true; elide: Text.ElideRight }
+                                Text { id: percentText; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: Math.min(100, root.analysisIndex * 20) + "%"; color: root.primary; font.pixelSize: 12; font.bold: true }
                             }
-
-                            Row {
-                                anchors.centerIn: parent
-                                spacing: 6
-                                Text {
-                                    text: "Отправить"
-                                    font.bold: true
-                                    font.pixelSize: 12
-                                    color: "#ffffff"
-                                }
-                                Text {
-                                    text: "➔"
-                                    font.bold: true
-                                    font.pixelSize: 12
-                                    color: "#ffffff"
-                                }
-                            }
-
-                            MouseArea {
-                                id: sendMouse
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                cursorShape: (activeCtrl && activeCtrl.busy) ? Qt.ArrowCursor : Qt.PointingHandCursor
-                                onClicked: root.sendCurrentPrompt()
-                            }
-                        }
-
-                        // Cancel Button
-                        Rectangle {
-                            visible: activeCtrl ? activeCtrl.busy : false
-                            width: 110
-                            height: 28
-                            radius: 6
-                            color: cancelMouse.containsMouse ? "#fecaca" : root.colErrorContainer
-                            border.color: "#fca5a5"
-                            border.width: 1
-
-                            Text {
-                                anchors.centerIn: parent
-                                text: "Отмена ✕"
-                                font.bold: true
-                                font.pixelSize: 11
-                                color: root.colError
-                            }
-
-                            MouseArea {
-                                id: cancelMouse
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: {
-                                    if (activeCtrl && activeCtrl.cancelRequest) {
-                                        activeCtrl.cancelRequest()
+                            Text { text: root.analysisDetail + " · " + root.elapsedText(); color: root.muted; font.pixelSize: 10; wrapMode: Text.Wrap; width: parent.width }
+                            ProgressTrack { width: parent.width; value: root.analysisIndex / 5; busy: activeCtrl && activeCtrl.busy; barColor: root.primary }
+                            Column {
+                                width: parent.width
+                                Repeater {
+                                    model: root.analysisNames
+                                    delegate: StepRow {
+                                        width: parent.width
+                                        label: modelData
+                                        status: root.stepStatus(index, root.analysisIndex)
+                                        inkColor: root.ink
+                                        mutedColor: root.muted
+                                        primaryColor: root.primary
+                                        successColor: root.success
                                     }
                                 }
                             }
+                            Text {
+                                width: parent.width
+                                visible: root.elapsedSec >= 45 && activeCtrl && activeCtrl.busy
+                                text: "Ответ нейросети занимает больше обычного. Каждый шаг агента — отдельный запрос к LLM, на медленном API это может занять 1–2 минуты."
+                                color: root.warning
+                                font.pixelSize: 10
+                                wrapMode: Text.Wrap
+                            }
+                            Button { text: "Отменить анализ"; visible: activeCtrl && activeCtrl.busy; onClicked: root.cancelTask() }
                         }
                     }
                 }
             }
         }
+
+        // ---------------------------------------------------------------
+        // 3. RECOMMENDATION + AI CHANGE PANEL
+        // ---------------------------------------------------------------
+        Item {
+            anchors.fill: parent
+            anchors.margins: 24
+            visible: root.phase === "recommend"
+            Column {
+                anchors.fill: parent
+                spacing: 10
+                Row {
+                    width: parent.width
+                    Text { text: "Профиль печати готов"; color: root.ink; font.pixelSize: 22; font.bold: true }
+                    Item { width: parent.width - 300; height: 1 }
+                    Rectangle { width: 150; height: 25; radius: 5; color: "#e5f6ee"; Text { anchors.centerIn: parent; text: "✓ Готово к применению"; color: root.success; font.pixelSize: 10; font.bold: true } }
+                }
+                Text { text: "Проверьте рекомендации. Вы можете попросить AI изменить их перед применением."; color: root.muted; font.pixelSize: 11 }
+                Row {
+                    width: parent.width
+                    height: parent.height - 105
+                    spacing: 12
+                    Rectangle {
+                        width: parent.width * 0.28
+                        height: parent.height
+                        radius: 8
+                        color: "#ffffff"
+                        border.color: root.border
+                        Column {
+                            anchors.fill: parent
+                            Text { text: "ОРИЕНТАЦИЯ МОДЕЛИ"; color: root.muted; font.pixelSize: 9; height: 32; anchors.left: parent.left; anchors.margins: 12; verticalAlignment: Text.AlignVCenter }
+                            ModelPreview { width: parent.width; height: parent.height - 75; controller: root.activeCtrl }
+                            Text { text: "✦ Ориентация рекомендована AI"; color: root.primary; font.pixelSize: 9; anchors.horizontalCenter: parent.horizontalCenter; height: 42; verticalAlignment: Text.AlignVCenter }
+                        }
+                    }
+                    Rectangle {
+                        width: parent.width * 0.37
+                        height: parent.height
+                        radius: 8
+                        color: "#ffffff"
+                        border.color: root.border
+                        Column {
+                            anchors.fill: parent
+                            Text { text: "Подобранные характеристики"; color: root.ink; font.pixelSize: 12; font.bold: true; height: 35; anchors.left: parent.left; anchors.margins: 12; verticalAlignment: Text.AlignVCenter }
+                            Column {
+                                width: parent.width
+                                Repeater {
+                                    model: [
+                                        ["Режим печати", activeCtrl ? activeCtrl.printMode : "3D"],
+                                        ["Материал", activeCtrl ? activeCtrl.material : "PP"],
+                                        ["Профиль", "High Strength"],
+                                        ["Высота слоя", "0,20 мм"],
+                                        ["Сопло", "0,6 мм · закалённое"],
+                                        ["Температура сопла", "250 °C"],
+                                        ["Заполнение", "100%"],
+                                        ["Поддержки", "Локальные, съёмные"]
+                                    ]
+                                    delegate: Rectangle {
+                                        width: parent.width
+                                        height: 25
+                                        color: index % 2 === 0 ? "#f1f7fa" : "#ffffff"
+                                        Text { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: modelData[0]; color: root.muted; font.pixelSize: 10 }
+                                        Text { anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter; text: modelData[1]; color: index === 0 || index === 1 || index === 6 ? root.primary : root.ink; font.pixelSize: 10; font.bold: index === 0 || index === 1 }
+                                    }
+                                }
+                            }
+                            Rectangle { width: parent.width - 20; height: 1; color: root.border; anchors.horizontalCenter: parent.horizontalCenter }
+                            Text { text: "Что оптимизировано"; color: "#396c85"; font.pixelSize: 10; font.bold: true; anchors.left: parent.left; anchors.margins: 12; height: 25; verticalAlignment: Text.AlignVCenter }
+                            Text { text: "AI учёл геометрию, цель печати и доступные профили. Нажмите «Почему так?» или попросите изменить рекомендацию."; color: root.muted; font.pixelSize: 9; wrapMode: Text.Wrap; width: parent.width - 24; anchors.left: parent.left; anchors.margins: 12 }
+                        }
+                    }
+                    Rectangle {
+                        width: parent.width * 0.35 - 24
+                        height: parent.height
+                        radius: 8
+                        color: "#ffffff"
+                        border.color: root.border
+                        Column {
+                            anchors.fill: parent
+                            anchors.margins: 10
+                            spacing: 7
+                            Row {
+                                width: parent.width
+                                Text { text: "✦"; color: root.warning; font.pixelSize: 18 }
+                                Column { Text { text: "Изменить с AI"; color: root.ink; font.pixelSize: 11; font.bold: true }
+Text { text: "Спросите или измените настройку"; color: root.muted; font.pixelSize: 9 } }
+                            }
+                            Button { text: "Почему выбраны эти настройки?"; width: parent.width; onClicked: changeInput.text = "Почему ты выбрал эти настройки?" }
+                            Flow {
+                                width: parent.width
+                                spacing: 4
+                                Repeater {
+                                    model: ["Быстрее", "Без поддержек", "Режим 5D", "PETG"]
+                                    delegate: Button { text: modelData; onClicked: root.askChange(modelData) }
+                                }
+                            }
+                            ListView {
+                                id: changeList
+                                width: parent.width
+                                height: parent.height - 180
+                                clip: true
+                                spacing: 5
+                                model: changeMessages
+                                delegate: Rectangle { width: changeList.width; height: changeText.implicitHeight + 14; radius: 6; color: model.role === "user" ? root.primarySoft : "#f6fafc"; border.color: root.border; Text { id: changeText; anchors.fill: parent; anchors.margins: 7; text: model.text; color: root.ink; font.pixelSize: 9; wrapMode: Text.Wrap } }
+                            }
+                            Row {
+                                width: parent.width
+                                spacing: 5
+                                TextField { id: changeInput; width: parent.width - 38; placeholderText: "Например: заполнение 40%"; font.pixelSize: 10; onAccepted: root.askChange(text) }
+                                Button { text: "↑"; width: 32; onClicked: root.askChange(changeInput.text); enabled: !(activeCtrl && activeCtrl.busy) }
+                            }
+                        }
+                    }
+                }
+                Rectangle { width: parent.width; height: 38; radius: 5; color: "#fff8e8"; border.color: "#f0dcae"; Text { anchors.fill: parent; anchors.margins: 10; text: "⚠ Предварительный профиль требует калибровки и проверки материала перед серийной печатью."; color: root.warning; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter } }
+            }
+            Rectangle {
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 58
+                color: "#ffffff"
+                border.color: root.border
+                RowLayout { anchors.fill: parent; anchors.leftMargin: 24; anchors.rightMargin: 24; Button { text: "Изменить задачу"; onClicked: root.resetToUpload() }
+Item { Layout.fillWidth: true }
+Button { text: "Применить настройки  →"; onClicked: root.applyRecommendation(); enabled: !(activeCtrl && activeCtrl.busy) } }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // 4. APPLYING
+        // ---------------------------------------------------------------
+        Item {
+            anchors.fill: parent
+            anchors.margins: 30
+            visible: root.phase === "apply"
+            Column {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 80, 720)
+                spacing: 16
+                Text { text: "Применяем настройки"; color: root.ink; font.pixelSize: 24; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter }
+                Text { text: "Передаём выбранный профиль в STE Slicer. Слайсинг не запускается на этом шаге."; color: root.muted; font.pixelSize: 12; anchors.horizontalCenter: parent.horizontalCenter }
+                Rectangle {
+                    width: parent.width
+                    height: applyColumn.implicitHeight + 48
+                    radius: 10
+                    color: "#ffffff"
+                    border.color: root.border
+                    Column {
+                        id: applyColumn
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 24
+                        spacing: 8
+                        Item {
+                            width: parent.width
+                            height: 22
+                            StepIcon { id: applyIcon; anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; status: activeCtrl && activeCtrl.busy ? "active" : "done"; activeColor: root.primary; doneColor: root.success }
+                            Text { anchors.left: applyIcon.right; anchors.leftMargin: 8; anchors.verticalCenter: parent.verticalCenter; text: "Применение профиля"; color: root.ink; font.bold: true; font.pixelSize: 13 }
+                            Text { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: Math.min(100, root.applyIndex * 20) + "%"; color: root.primary; font.bold: true; font.pixelSize: 12 }
+                        }
+                        ProgressTrack { width: parent.width; value: root.applyIndex / 5; busy: activeCtrl && activeCtrl.busy; barColor: root.primary }
+                        Repeater {
+                            model: root.applyNames
+                            delegate: StepRow { width: parent.width; label: modelData; status: root.stepStatus(index, root.applyIndex); inkColor: root.ink; mutedColor: root.muted; primaryColor: root.primary; successColor: root.success }
+                        }
+                    }
+                }
+                Text { text: "Прошло " + root.elapsedText(); color: root.muted; font.pixelSize: 10; anchors.horizontalCenter: parent.horizontalCenter }
+                Button { text: "Отменить"; anchors.horizontalCenter: parent.horizontalCenter; onClicked: root.cancelTask() }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // DONE / ERROR
+        // ---------------------------------------------------------------
+        Item {
+            anchors.fill: parent
+            visible: root.phase === "done" || root.phase === "error"
+            Column {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - 80, 600)
+                spacing: 13
+                Text { text: root.phase === "done" ? "✓" : "!"; color: root.phase === "done" ? root.success : root.danger; font.pixelSize: 52; anchors.horizontalCenter: parent.horizontalCenter }
+                Text { text: root.phase === "done" ? "Настройки применены" : "Не удалось завершить операцию"; color: root.ink; font.pixelSize: 23; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter }
+                Text { text: root.phase === "done" ? "Профиль, материал, режим и ориентация переданы в STE Slicer." : root.lastError; color: root.muted; font.pixelSize: 12; wrapMode: Text.Wrap; width: parent.width; horizontalAlignment: Text.AlignHCenter }
+                Row { anchors.horizontalCenter: parent.horizontalCenter; spacing: 8; visible: root.phase === "done"; Repeater { model: ["Режим: " + (activeCtrl ? activeCtrl.printMode : "3D"), "Материал: " + (activeCtrl ? activeCtrl.material : "PP"), "Профиль: High Strength"]; delegate: Rectangle { width: 145; height: 42; radius: 6; color: "#ffffff"; border.color: root.border; Text { anchors.centerIn: parent; text: modelData; color: root.ink; font.pixelSize: 10 } } } }
+                Row { anchors.horizontalCenter: parent.horizontalCenter; spacing: 8; Button { text: root.phase === "done" ? "Готово" : "Вернуться к рекомендации"; onClicked: root.phase === "done" ? root.close() : root.phase = "recommend" }
+Button { visible: root.phase === "error"; text: "Начать заново"; onClicked: root.resetToUpload() } }
+            }
+        }
     }
 
-    // =========================================================================
-    // 7. AGENT LOG DRAWER (Slide-in Panel with Prominent Close Button)
-    // =========================================================================
-    AgentLogDrawer {
-        id: logDrawer
-        anchors.right: parent.right
-        anchors.top: parent.top
-        anchors.topMargin: 64
-        anchors.bottom: parent.bottom
-        width: Math.min(460, root.width * 0.44)
-        controller: root.activeCtrl
-        opened: false
-        z: 30
-    }
+    AgentLogDrawer { id: logDrawer; anchors.right: parent.right; anchors.top: contextBar.bottom; anchors.bottom: parent.bottom; width: Math.min(450, root.width * .42); controller: root.activeCtrl; opened: false; z: 20 }
 }

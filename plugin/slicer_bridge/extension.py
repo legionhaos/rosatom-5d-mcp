@@ -321,6 +321,20 @@ class STEAIExtension(QObject, Extension):
             logger.error("Не удалось создать QML компонент %s: %s", file_name, exc)
             return None
 
+    def _watch_scene_models(self):
+        # Models loaded through the slicer itself (File > Open, drag onto the
+        # build plate) are not attachments, so track the scene directly.
+        if self._controller is None:
+            return
+        if not getattr(self, "_scene_watch_connected", False):
+            app = self._application()
+            try:
+                app.getController().getScene().sceneChanged.connect(self._controller.onSceneChanged)
+                self._scene_watch_connected = True
+            except Exception as exc:
+                logger.warning("Не удалось подписаться на sceneChanged: %s", exc)
+        self._controller.refreshModelCount()
+
     @pyqtSlot()
     def showChatWindow(self):
         try:
@@ -338,6 +352,8 @@ class STEAIExtension(QObject, Extension):
 
             if self._camera_manager is not None:
                 self._camera_manager.set_chat_window(self._chat_view)
+
+            self._watch_scene_models()
 
             if hasattr(self._chat_view, "show"):
                 self._chat_view.show()
