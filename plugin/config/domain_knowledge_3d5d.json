@@ -49,7 +49,7 @@
   },
   "materials_catalog": {
     "PLA": {
-      "name": "PLA (Полилиактид)",
+      "name": "PLA (Полилактид)",
       "type": "Термопласт общего назначения",
       "nozzle_temp_range": [190, 220],
       "nozzle_temp_recommended": 205,

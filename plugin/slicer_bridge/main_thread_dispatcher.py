@@ -1,18 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-MainThreadDispatcher for STE Slicer.
-
-Provides 100% thread-safe execution of Cura/Uranium API and Qt GUI operations
-from background threads (such as AgentWorker QThread).
-"""
-
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import functools
 import logging
-import sys
 import threading
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable
 
 try:
     from PyQt5.QtCore import QCoreApplication, QThread
@@ -31,128 +21,136 @@ except ImportError:
 
 logger = logging.getLogger("MainThreadDispatcher")
 
-
-def is_main_thread():
-    # type: () -> bool
-    """Проверяет, выполняется ли текущий код в главном GUI-потоке Qt/Python."""
-    if QCoreApplication is not None:
-        app = QCoreApplication.instance()
-        if app is not None and QThread is not None:
-            try:
-                return QThread.currentThread() == app.thread()
-            except Exception:
-                pass
-    if hasattr(threading, "main_thread"):
-        return threading.current_thread() is threading.main_thread()
-    return isinstance(threading.current_thread(), threading._MainThread)
+_DEFAULT_TIMEOUT_SEC = 30.0
 
 
 class MainThreadDispatcher(object):
-    """
-    Диспетчер потокобезопасного выполнения функций в основном потоке GUI STE Slicer/Cura.
-    Поддерживает как статический вызов (MainThreadDispatcher.run_sync),
-    так и вызов через экземпляр (dispatcher.execute_sync).
-    """
 
-    def __init__(self, timeout=30.0):
-        # type: (float) -> None
-        self.default_timeout = float(timeout)
+    @classmethod
+    def _application(cls):
+        try:
+            from UM.Application import Application
+            app = Application.getInstance()
+            if app is not None:
+                return app
+        except Exception:
+            pass
+        try:
+            from cura.CuraApplication import CuraApplication
+            return CuraApplication.getInstance()
+        except Exception:
+            return None
+
+    @classmethod
+    def is_main_thread(cls):
+        # type: () -> bool
+        if QCoreApplication is None or QThread is None:
+            return True
+        app = QCoreApplication.instance()
+        if app is None:
+            return True
+        try:
+            return QThread.currentThread() == app.thread()
+        except Exception:
+            return True
+
+    @classmethod
+    def _post_to_main_thread(cls, func):
+        # type: (Callable[[], Any]) -> bool
+        app = cls._application()
+        if app is None:
+            return False
+        try:
+            from UM.Application import Application
+            from UM.Event import CallFunctionEvent
+            event = CallFunctionEvent(func, (), {})
+            Application.getInstance().functionEvent(event)
+            return True
+        except Exception:
+            pass
+        poster = getattr(app, "callLater", None)
+        if poster is not None:
+            try:
+                poster(func)
+                return True
+            except Exception:
+                pass
+        return False
 
     @classmethod
     def execute_sync(cls, func, *args, **kwargs):
         # type: (Callable[..., Any], Any, Any) -> Any
-        """
-        Ставит функцию func в очередь главного потока GUI через CuraApplication.callLater(),
-        блокирует вызывающий рабочий поток до завершения и возвращает результат либо
-        пробрасывает возникшее исключение.
-        """
-        timeout = kwargs.pop("timeout", 30.0)
+        timeout = kwargs.pop("timeout", _DEFAULT_TIMEOUT_SEC)
 
-        # Если уже в главном потоке или Qt не запущен — вызываем напрямую
-        if is_main_thread():
-            return func(*args, **kwargs)
-
-        app = None
-        try:
-            from cura.CuraApplication import CuraApplication
-            app = CuraApplication.getInstance()
-        except Exception:
-            try:
-                from UM.Application import Application
-                app = Application.getInstance()
-            except Exception:
-                app = None
-
-        if app is None or not hasattr(app, "callLater"):
-            # Вне слайсера (юнит-тесты) вызываем напрямую
+        if cls.is_main_thread():
             return func(*args, **kwargs)
 
         result_box = [None]
         error_box = [None]
-        done_event = threading.Event()
+        done = threading.Event()
 
-        def _worker():
+        def _runner():
             try:
                 result_box[0] = func(*args, **kwargs)
-            except BaseException as e:
-                error_box[0] = e
+            except BaseException as exc:
+                error_box[0] = exc
             finally:
-                done_event.set()
+                done.set()
 
-        try:
-            app.callLater(_worker)
-        except Exception as e:
-            logger.warning("app.callLater failed: %s; executing directly.", e)
+        if not cls._post_to_main_thread(_runner):
             return func(*args, **kwargs)
 
-        finished = done_event.wait(timeout=timeout)
-        if not finished:
+        if not done.wait(timeout):
             raise TimeoutError(
-                "MainThreadDispatcher timed out after {0}s waiting for {1}".format(
-                    timeout, getattr(func, "__name__", str(func))
-                )
+                "Операция в главном потоке GUI не завершилась за {0} с.".format(timeout)
             )
 
         if error_box[0] is not None:
             raise error_box[0]
-
         return result_box[0]
 
     @classmethod
+    def run_sync(cls, func, *args, **kwargs):
+        # type: (Callable[..., Any], Any, Any) -> Any
+        return cls.execute_sync(func, *args, **kwargs)
+
+    @classmethod
+    def call_on_main_thread(cls, func, *args, **kwargs):
+        # type: (Callable[..., Any], Any, Any) -> Any
+        return cls.execute_sync(func, *args, **kwargs)
+
+    @classmethod
     def execute_async(cls, func, *args, **kwargs):
-        # type: (Callable[..., None], Any, Any) -> None
-        """Неблокирующая постановка вызова функции в очередь главного потока."""
-        if is_main_thread():
-            func(*args, **kwargs)
-            return
-
-        app = None
-        try:
-            from cura.CuraApplication import CuraApplication
-            app = CuraApplication.getInstance()
-        except Exception:
+        # type: (Callable[..., Any], Any, Any) -> bool
+        if cls.is_main_thread():
             try:
-                from UM.Application import Application
-                app = Application.getInstance()
-            except Exception:
-                app = None
+                func(*args, **kwargs)
+                return True
+            except Exception as exc:
+                logger.error("execute_async direct call failed: %s", exc)
+                return False
 
-        if app is not None and hasattr(app, "callLater"):
-            app.callLater(lambda: func(*args, **kwargs))
-        else:
-            func(*args, **kwargs)
+        def _runner():
+            try:
+                func(*args, **kwargs)
+            except Exception as exc:
+                logger.error("execute_async main-thread call failed: %s", exc)
 
-    # Совместимость со всеми вызовами в проекте:
-    run_sync = execute_sync
-    call_on_main_thread = execute_sync
-
-
-def run_in_main_thread(func):
-    """Декоратор для автоматического выполнения метода в главном потоке."""
-    @functools.wraps(func)
-    def _wrapper(*args, **kwargs):
-        return MainThreadDispatcher.execute_sync(func, *args, **kwargs)
-    return _wrapper
+        return cls._post_to_main_thread(_runner)
 
 
-__all__ = ["MainThreadDispatcher", "run_in_main_thread", "is_main_thread"]
+def run_in_main_thread(timeout=_DEFAULT_TIMEOUT_SEC):
+    def _decorator(func):
+        @functools.wraps(func)
+        def _wrapper(*args, **kwargs):
+            return MainThreadDispatcher.execute_sync(func, *args, timeout=timeout, **kwargs)
+        return _wrapper
+
+    if callable(timeout):
+        _target = timeout
+        timeout = _DEFAULT_TIMEOUT_SEC
+        return _decorator(_target)
+    return _decorator
+
+
+__all__ = ["MainThreadDispatcher", "run_in_main_thread"]

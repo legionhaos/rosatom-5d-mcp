@@ -1,16 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-SlicerEventListener for STE Slicer.
-
-Monitors scene events, model loading, active printer/mode/material changes,
-and synchronizes asynchronous CuraEngine slicing progress with MCP tools.
-"""
-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import logging
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 try:
     from PyQt5.QtCore import QObject, pyqtSignal
@@ -25,156 +18,145 @@ except ImportError:
                 from PySide6.QtCore import QObject, Signal as pyqtSignal
             except ImportError:
                 class QObject(object):
-                    def __init__(self, parent=None):
-                        self.parent = parent
+                    def __init__(self, *args, **kwargs):
+                        pass
 
-                def pyqtSignal(*types):
-                    return None
+                class _Sig(object):
+                    def __init__(self, *a, **k):
+                        self._slots = []
+
+                    def __get__(self, inst, owner):
+                        return self
+
+                    def connect(self, slot):
+                        self._slots.append(slot)
+
+                    def emit(self, *a):
+                        for s in list(self._slots):
+                            try:
+                                s(*a)
+                            except Exception:
+                                pass
+
+                def pyqtSignal(*a, **k):
+                    return _Sig()
 
 logger = logging.getLogger("SlicerEventListener")
 
 
 class SlicerEventListener(QObject):
-    """
-    Слушатель событий ядра STE Slicer / Cura 3.6.
-    Синхронизирует асинхронный C++ движок CuraEngine с синхронными вызовами MCP-тулов.
-    """
 
-    modelLoaded = pyqtSignal(str) if pyqtSignal is not None else None
-    sceneModified = pyqtSignal() if pyqtSignal is not None else None
-    slicingFinishedSignal = pyqtSignal() if pyqtSignal is not None else None
+    sceneChangedSignal = pyqtSignal(object)
+    slicingFinishedSignal = pyqtSignal()
+    slicingFailedSignal = pyqtSignal(str)
 
     def __init__(self, application=None, parent=None):
-        # type: (Optional[Any], Optional[Any]) -> None
+        # type: (Any, Any) -> None
         super(SlicerEventListener, self).__init__(parent)
-        self._application = application
-        self.slicing_completed_event = threading.Event()
-        self._is_slicing = False
+        self._app = application
+        self._slicing_done = threading.Event()
+        self._last_backend_state = None
         self._attached = False
 
-        if self._application is None:
-            try:
-                from cura.CuraApplication import CuraApplication
-                self._application = CuraApplication.getInstance()
-            except Exception:
-                self._application = None
-
-        if self._application is not None:
-            self.attach_signals()
+    def _application(self):
+        if self._app is not None:
+            return self._app
+        try:
+            from cura.CuraApplication import CuraApplication
+            self._app = CuraApplication.getInstance()
+        except Exception:
+            self._app = None
+        return self._app
 
     def attach_signals(self):
-        # type: () -> None
-        """Подписывается на сигналы сцены, бэкенда и менеджера машины."""
-        if self._attached or self._application is None:
-            return
+        # type: () -> bool
+        if self._attached:
+            return True
+
+        app = self._application()
+        if app is None:
+            logger.warning("SlicerEventListener: CuraApplication недоступно, сигналы не подключены.")
+            return False
 
         try:
-            # 1. Сцена: добавление / удаление / трансформация объектов
-            controller = self._application.getController()
-            if controller:
-                scene = controller.getScene()
-                if scene and hasattr(scene, "sceneChanged"):
-                    scene.sceneChanged.connect(self._on_scene_changed)
+            controller = app.getController()
+            scene = controller.getScene() if controller else None
+            if scene is not None and hasattr(scene, "sceneChanged"):
+                scene.sceneChanged.connect(self._on_scene_changed)
+        except Exception as exc:
+            logger.warning("Не удалось подключить sceneChanged: %s", exc)
 
-            # 2. Окончание загрузки файла
-            if hasattr(self._application, "fileCompleted"):
-                self._application.fileCompleted.connect(self._on_file_completed)
-            elif hasattr(self._application, "fileLoaded"):
-                self._application.fileLoaded.connect(self._on_file_completed)
+        try:
+            backend = app.getBackend()
+            if backend is not None and hasattr(backend, "backendStateChange"):
+                backend.backendStateChange.connect(self._on_backend_state_change)
+            if backend is not None and hasattr(backend, "slicingCancelled"):
+                backend.slicingCancelled.connect(self._on_slicing_cancelled)
+        except Exception as exc:
+            logger.warning("Не удалось подключить сигналы backend: %s", exc)
 
-            # 3. Смена глобального контейнера / принтера / режима 3D-5D
-            try:
-                from cura.Settings.CuraContainerRegistry import CuraContainerRegistry
-                registry = CuraContainerRegistry.getInstance()
-                if hasattr(registry, "containerAdded"):
-                    pass
-            except Exception:
-                pass
-
-            machine_mgr = None
-            try:
-                machine_mgr = self._application.getMachineManager()
-            except Exception:
-                pass
-
-            if machine_mgr and hasattr(machine_mgr, "globalContainerChanged"):
-                machine_mgr.globalContainerChanged.connect(self._on_machine_changed)
-
-            # 4. Бэкенд слайсера CuraEngine
-            backend = None
-            try:
-                backend = self._application.getBackend()
-            except Exception:
-                pass
-
-            if backend:
-                if hasattr(backend, "slicingFinished"):
-                    backend.slicingFinished.connect(self._on_slicing_finished)
-                if hasattr(backend, "backendStateChange"):
-                    backend.backendStateChange.connect(self._on_backend_state_change)
-
-            self._attached = True
-            logger.info("SlicerEventListener successfully attached to Cura signals.")
-        except Exception as e:
-            logger.warning("Could not attach all SlicerEventListener signals: %s", e)
+        self._attached = True
+        return True
 
     def _on_scene_changed(self, source=None):
-        # type: (Optional[Any]) -> None
-        """Отслеживает изменение нод на сцене."""
-        logger.debug("Scene changed: %s", source)
-        if self.sceneModified is not None and hasattr(self.sceneModified, "emit"):
-            try:
-                self.sceneModified.emit()
-            except Exception:
-                pass
+        # type: (Any) -> None
+        try:
+            self.sceneChangedSignal.emit(source)
+        except Exception:
+            pass
 
-    def _on_file_completed(self, file_path=""):
+    def _on_backend_state_change(self, state):
+        # type: (Any) -> None
+        self._last_backend_state = state
+        done_state = self._resolve_done_state()
+        error_state = self._resolve_error_state()
+
+        if done_state is not None and state == done_state:
+            self._on_slicing_finished()
+        elif error_state is not None and state == error_state:
+            self._on_slicing_failed("Backend перешёл в состояние ошибки.")
+
+    def _resolve_done_state(self):
+        try:
+            from UM.Backend.Backend import BackendState
+            return BackendState.Done
+        except Exception:
+            return None
+
+    def _resolve_error_state(self):
+        try:
+            from UM.Backend.Backend import BackendState
+            return BackendState.Error
+        except Exception:
+            return None
+
+    def _on_slicing_finished(self, backend=None):
+        # type: (Any) -> None
+        self._slicing_done.set()
+        try:
+            self.slicingFinishedSignal.emit()
+        except Exception:
+            pass
+
+    def _on_slicing_failed(self, message):
         # type: (str) -> None
-        """Вызывается при загрузке новой модели на рабочий стол."""
-        logger.info("File loaded into scene: %s", file_path)
-        if self.modelLoaded is not None and hasattr(self.modelLoaded, "emit"):
-            try:
-                self.modelLoaded.emit(str(file_path))
-            except Exception:
-                pass
+        self._slicing_done.set()
+        try:
+            self.slicingFailedSignal.emit(str(message))
+        except Exception:
+            pass
 
-    def _on_machine_changed(self):
+    def _on_slicing_cancelled(self):
         # type: () -> None
-        logger.debug("Global container / machine configuration changed.")
+        self._slicing_done.set()
 
-    def _on_backend_state_change(self, state=None):
-        # type: (Optional[Any]) -> None
-        logger.debug("Backend state changed: %s", state)
-
-    def _on_slicing_finished(self, *args, **kwargs):
-        # type: (Any, Any) -> None
-        """Сигнализирует о завершении генерации G-code в CuraEngine."""
-        logger.info("CuraEngine slicingFinished signal received.")
-        self._is_slicing = False
-        self.slicing_completed_event.set()
-        if self.slicingFinishedSignal is not None and hasattr(self.slicingFinishedSignal, "emit"):
-            try:
-                self.slicingFinishedSignal.emit()
-            except Exception:
-                pass
-
-    def reset_slicing_event(self):
+    def reset(self):
         # type: () -> None
-        """Сбрасывает флаг готовности слайсинга перед запуском новой нарезки."""
-        self._is_slicing = True
-        self.slicing_completed_event.clear()
+        self._slicing_done.clear()
 
     def wait_for_slicing(self, timeout_sec=90.0):
         # type: (float) -> bool
-        """
-        Блокирует вызывающий поток (MCP tool) до завершения слайсинга.
-
-        Returns:
-            bool: True если слайсинг успешно завершился вовремя, иначе False (тайм-аут).
-        """
-        finished = self.slicing_completed_event.wait(timeout=float(timeout_sec))
-        self._is_slicing = False
-        return finished
+        return self._slicing_done.wait(timeout=timeout_sec)
 
 
 __all__ = ["SlicerEventListener"]

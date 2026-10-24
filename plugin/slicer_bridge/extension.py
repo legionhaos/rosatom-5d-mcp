@@ -1,109 +1,163 @@
 # -*- coding: utf-8 -*-
-"""
-STEAIExtension for STE Slicer (Cura 3.6 / Uranium).
-
-Main extension class integrating the AI Assistant into the slicer lifecycle,
-registering menu items, creating QML dialogs, and wiring the agent architecture.
-"""
-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import json
 import logging
 import os
-import sys
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
-# Безопасный импорт Uranium Extension
+try:
+    from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
+except ImportError:
+    try:
+        from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+    except ImportError:
+        try:
+            from PySide2.QtCore import QObject, Signal as pyqtSignal, Slot as pyqtSlot
+        except ImportError:
+            from PySide6.QtCore import QObject, Signal as pyqtSignal, Slot as pyqtSlot
+
 try:
     from UM.Extension import Extension
 except ImportError:
     class Extension(object):
-        """Резервный базовый класс Extension вне Uranium."""
         def __init__(self):
             self._menu_items = []
 
-        def addMenuItem(self, name, callback):
-            self._menu_items.append((name, callback))
+        def addMenuItem(self, name, function):
+            self._menu_items.append((name, function))
 
-from plugin.config.settings_config import PluginSettingsManager
-from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher, run_in_main_thread
-from plugin.slicer_bridge.event_listener import SlicerEventListener
-from plugin.slicer_bridge.camera_and_viewport import ViewportCameraManager
-from plugin.mcp_server.server import MCPServer
-from plugin.agent.orchestrator import AgentOrchestrator
-from plugin.agent.worker import AgentWorker
-from plugin.ui.chat_controller import ChatController
-from plugin.utils.logger import STEPluginLogger, get_logger
+logger = logging.getLogger("STEAIExtension")
 
-logger = get_logger("STEAIExtension")
+_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_QML_DIR = os.path.join(_PLUGIN_DIR, "ui", "qml")
+
+
+class AgentBackendAdapter(QObject):
+
+    stepStarted = pyqtSignal(str, str)
+    toolCallStarted = pyqtSignal(str, str, object)
+    toolCallFinished = pyqtSignal(str, str, object, int)
+    responseReady = pyqtSignal(object)
+    taskFailed = pyqtSignal(str)
+
+    def __init__(self, worker, settings_mgr=None, orchestrator=None, parent=None):
+        # type: (Any, Any, Any, Any) -> None
+        super(AgentBackendAdapter, self).__init__(parent)
+        self._worker = worker
+        self._settings_mgr = settings_mgr
+        self._orchestrator = orchestrator
+        self._call_names = {}  # type: Dict[str, str]
+        self._connect_worker()
+
+    def _connect_worker(self):
+        if self._worker is None:
+            return
+        try:
+            self._worker.toolCallStarted.connect(self._on_tool_started)
+            self._worker.toolCallFinished.connect(self._on_tool_finished)
+            self._worker.finalAnswerReceived.connect(self._on_final_answer)
+            self._worker.workerError.connect(self._on_worker_error)
+        except (TypeError, RuntimeError, AttributeError) as exc:
+            logger.warning("Не удалось подключить сигналы AgentWorker: %s", exc)
+
+    def send_prompt(self, text, attachments=None):
+        # type: (str, Optional[List[str]]) -> None
+        if self._worker is None:
+            self.taskFailed.emit("AgentWorker недоступен.")
+            return
+        paths = list(attachments or [])
+        try:
+            if self._worker.isRunning():
+                self.taskFailed.emit("Агент уже обрабатывает запрос.")
+                return
+        except Exception:
+            pass
+        self.stepStarted.emit("Запуск", "Агент начал обработку запроса.")
+        self._worker.set_task(text, paths)
+        self._worker.start()
+
+    def cancel(self):
+        if self._worker is not None:
+            cancel = getattr(self._worker, "cancel", None)
+            if cancel is not None:
+                cancel()
+
+    def configure(self, base_url, api_key, model):
+        # type: (str, str, str) -> None
+        if self._settings_mgr is not None:
+            self._settings_mgr.save_llm_config(base_url, api_key, model)
+        if self._orchestrator is not None:
+            rebuild = getattr(self._orchestrator, "reload_llm_client", None)
+            if rebuild is not None:
+                rebuild()
+
+    def check_connection(self, base_url, api_key, model):
+        # type: (str, str, str) -> bool
+        try:
+            from plugin.agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
+        except ImportError:
+            from ..agent.llm_client import OpenAICompatibleClient, LLMConnectionConfig
+
+        config = LLMConnectionConfig(
+            api_url=base_url,
+            api_key=api_key,
+            model_name=model,
+            timeout_sec=10,
+            temperature=0.1,
+        )
+        client = OpenAICompatibleClient(config)
+        ok, message = client.test_connection()
+        if not ok:
+            self.taskFailed.emit(message)
+        return ok
+
+    def _on_tool_started(self, call_id, tool_name, args_json):
+        self._call_names[str(call_id)] = str(tool_name)
+        try:
+            arguments = json.loads(args_json) if args_json else {}
+        except (ValueError, TypeError):
+            arguments = {"raw": str(args_json)}
+        self.toolCallStarted.emit(str(tool_name), str(call_id), arguments)
+
+    def _on_tool_finished(self, call_id, status, summary, duration_ms):
+        tool_name = self._call_names.pop(str(call_id), str(call_id))
+        self.toolCallFinished.emit(str(tool_name), str(status), summary, int(duration_ms))
+
+    def _on_final_answer(self, markdown_answer, summary_card):
+        payload = {"text": markdown_answer or "", "summary": dict(summary_card or {})}
+        self.responseReady.emit(payload)
+
+    def _on_worker_error(self, message):
+        self.taskFailed.emit(str(message))
 
 
 class STEAIExtension(Extension):
-    """
-    Главный класс расширения STE AI Assistant для STE Slicer.
-    """
 
-    def __init__(self, application=None):
-        # type: (Optional[Any]) -> None
+    def __init__(self):
         super(STEAIExtension, self).__init__()
-        self._application = application
-        self._chat_window = None
-        self._settings_dialog = None
 
-        logger.info("Initializing STEAIExtension...")
+        self._chat_view = None
+        self._settings_view = None
 
-        # 1. Диспетчер и настройки
-        self.dispatcher = MainThreadDispatcher()
-        self.settings_mgr = PluginSettingsManager(application=application)
+        self._dispatcher = None
+        self._settings_mgr = None
+        self._event_listener = None
+        self._camera_manager = None
+        self._mcp_server = None
+        self._orchestrator = None
+        self._worker = None
+        self._adapter = None
+        self._controller = None
 
-        # 2. Слушатель событий слайсера и камера
-        self.event_listener = SlicerEventListener(application=application)
-        self.camera_manager = ViewportCameraManager(application=application)
+        self._build_components()
 
-        # 3. Сервер MCP-инструментов
-        self.mcp_server = MCPServer(
-            dispatcher=self.dispatcher,
-            event_listener=self.event_listener,
-            settings_mgr=self.settings_mgr
-        )
+        self.addMenuItem("Открыть ИИ-чат", self.showChatWindow)
+        self.addMenuItem("Настройки LLM API", self.showSettingsDialog)
 
-        # 4. Оркестратор и фоновый воркер агента
-        self.orchestrator = AgentOrchestrator(
-            settings_mgr=self.settings_mgr,
-            mcp_server=self.mcp_server
-        )
-        self.worker = AgentWorker(orchestrator=self.orchestrator)
+        self._register_application_hook()
 
-        # 5. Контроллер интерфейса (связка QML <-> Agent)
-        self.chat_controller = ChatController(
-            agent_backend=self.worker,
-            slicer_bridge=self,
-            settings_store=self.settings_mgr
-        )
-
-        # 6. Регистрация пунктов меню STE Slicer
-        try:
-            self.addMenuItem("Открыть ИИ-чат", self.showChatWindow)
-            self.addMenuItem("Настройки LLM API", self.showSettingsDialog)
-            logger.info("Menu items registered: 'Открыть ИИ-чат', 'Настройки LLM API'")
-        except Exception as e:
-            logger.warning("Could not register menu items: %s", e)
-
-        # Подписка на готовность приложения
-        self._register_application_init_hook()
-
-    def _register_application_init_hook(self):
-        """Хук инициализации приложения для автоматического открытия чата."""
-        app = self._get_app()
-        if app and hasattr(app, "applicationInitialized"):
-            try:
-                app.applicationInitialized.connect(self.onApplicationInitialized)
-            except Exception:
-                pass
-
-    def _get_app(self):
-        if self._application is not None:
-            return self._application
+    def _application(self):
         try:
             from cura.CuraApplication import CuraApplication
             return CuraApplication.getInstance()
@@ -114,95 +168,126 @@ class STEAIExtension(Extension):
             except Exception:
                 return None
 
+    def _build_components(self):
+        app = self._application()
+
+        try:
+            from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
+            self._dispatcher = MainThreadDispatcher
+        except Exception as exc:
+            logger.error("Не удалось загрузить MainThreadDispatcher: %s", exc)
+
+        try:
+            from plugin.config.settings_config import PluginSettingsManager
+            self._settings_mgr = PluginSettingsManager(app)
+        except Exception as exc:
+            logger.error("Не удалось создать PluginSettingsManager: %s", exc)
+
+        try:
+            from plugin.slicer_bridge.event_listener import SlicerEventListener
+            self._event_listener = SlicerEventListener(app)
+        except Exception as exc:
+            logger.error("Не удалось создать SlicerEventListener: %s", exc)
+
+        try:
+            from plugin.slicer_bridge.camera_and_viewport import ViewportCameraManager
+            self._camera_manager = ViewportCameraManager(app)
+        except Exception as exc:
+            logger.error("Не удалось создать ViewportCameraManager: %s", exc)
+
+        try:
+            from plugin.mcp_server.server import MCPServer
+            self._mcp_server = MCPServer(
+                settings_mgr=self._settings_mgr,
+                event_listener=self._event_listener,
+                camera_manager=self._camera_manager,
+                dispatcher=self._dispatcher,
+            )
+        except Exception as exc:
+            logger.error("Не удалось создать MCPServer: %s", exc)
+
+        try:
+            from plugin.agent.orchestrator import AgentOrchestrator
+            self._orchestrator = AgentOrchestrator(
+                settings_mgr=self._settings_mgr,
+                mcp_server=self._mcp_server,
+            )
+        except Exception as exc:
+            logger.error("Не удалось создать AgentOrchestrator: %s", exc)
+
+        try:
+            from plugin.agent.worker import AgentWorker
+            self._worker = AgentWorker(orchestrator=self._orchestrator)
+        except Exception as exc:
+            logger.error("Не удалось создать AgentWorker: %s", exc)
+
+        try:
+            self._adapter = AgentBackendAdapter(
+                self._worker,
+                settings_mgr=self._settings_mgr,
+                orchestrator=self._orchestrator,
+            )
+        except Exception as exc:
+            logger.error("Не удалось создать AgentBackendAdapter: %s", exc)
+
+        try:
+            from plugin.ui.chat_controller import ChatController
+            self._controller = ChatController(
+                agent_backend=self._adapter,
+                slicer_bridge=self._camera_manager,
+                settings_store=None,
+            )
+        except Exception as exc:
+            logger.error("Не удалось создать ChatController: %s", exc)
+
+    def _register_application_hook(self):
+        app = self._application()
+        if app is None:
+            return
+        try:
+            if hasattr(app, "pluginsLoaded"):
+                app.pluginsLoaded.connect(self.onApplicationInitialized)
+            elif hasattr(app, "initializationFinished"):
+                app.initializationFinished.connect(self.onApplicationInitialized)
+        except Exception as exc:
+            logger.warning("Не удалось подключить хук инициализации: %s", exc)
+
     def onApplicationInitialized(self):
-        # type: () -> None
-        """Вызывается после полной загрузки всех подсистем STE Slicer."""
-        logger.info("CuraApplication initialized. STE AI Assistant is ready.")
-        try:
-            self.event_listener.attach_signals()
-        except Exception as e:
-            logger.debug("onApplicationInitialized notice: %s", e)
+        if self._event_listener is not None:
+            attach = getattr(self._event_listener, "attach_signals", None)
+            if attach is not None:
+                attach()
 
-    @run_in_main_thread
+    def _create_qml_component(self, file_name):
+        app = self._application()
+        if app is None:
+            return None
+        creator = getattr(app, "createQmlComponent", None)
+        if creator is None:
+            return None
+        path = os.path.join(_QML_DIR, file_name)
+        context = {"controller": self._controller, "manager": self}
+        try:
+            return creator(path, context)
+        except Exception as exc:
+            logger.error("Не удалось создать QML компонент %s: %s", file_name, exc)
+            return None
+
     def showChatWindow(self):
-        # type: () -> None
-        """Создает и отображает главное окно ИИ-чата (ChatWindow.qml)."""
-        logger.info("Opening AI Chat window...")
-        plugin_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        qml_path = os.path.join(plugin_root, "ui", "qml", "ChatWindow.qml")
-
-        if not os.path.isfile(qml_path):
-            logger.error("ChatWindow.qml not found at: %s", qml_path)
+        if self._chat_view is None:
+            self._chat_view = self._create_qml_component("ChatWindow.qml")
+        if self._chat_view is None:
             return
+        if self._camera_manager is not None:
+            self._camera_manager.set_chat_window(self._chat_view)
+        self._chat_view.show()
 
-        app = self._get_app()
-        if app and hasattr(app, "createQmlComponent"):
-            try:
-                if self._chat_window is None:
-                    self._chat_window = app.createQmlComponent(
-                        qml_path,
-                        {"controller": self.chat_controller}
-                    )
-                if self._chat_window and hasattr(self._chat_window, "show"):
-                    self._chat_window.show()
-                return
-            except Exception as e:
-                logger.warning("createQmlComponent failed: %s; trying QQuickView fallback.", e)
-
-        # Fallback для запуска окна через PyQt5 QQuickView
-        try:
-            from PyQt5.QtQuick import QQuickView
-            from PyQt5.QtCore import QUrl
-            if self._chat_window is None:
-                view = QQuickView()
-                view.setTitle("STE AI 3D/5D Print Assistant")
-                view.rootContext().setContextProperty("controller", self.chat_controller)
-                view.setSource(QUrl.fromLocalFile(qml_path))
-                view.setResizeMode(QQuickView.SizeRootObjectToView)
-                self._chat_window = view
-            self._chat_window.show()
-        except Exception as e:
-            logger.error("Could not display ChatWindow: %s", e)
-
-    @run_in_main_thread
     def showSettingsDialog(self):
-        # type: () -> None
-        """Открывает модальное окно настроек LLM API."""
-        logger.info("Opening LLM Settings dialog...")
-        if self._chat_window is not None:
-            self.showChatWindow()
+        if self._settings_view is None:
+            self._settings_view = self._create_qml_component("SettingsDialog.qml")
+        if self._settings_view is None:
             return
-
-        plugin_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        qml_path = os.path.join(plugin_root, "ui", "qml", "SettingsDialog.qml")
-
-        app = self._get_app()
-        if app and hasattr(app, "createQmlComponent"):
-            try:
-                if self._settings_dialog is None:
-                    self._settings_dialog = app.createQmlComponent(
-                        qml_path,
-                        {"controller": self.chat_controller}
-                    )
-                if self._settings_dialog and hasattr(self._settings_dialog, "show"):
-                    self._settings_dialog.show()
-                return
-            except Exception as e:
-                logger.debug("Settings createQmlComponent notice: %s", e)
-
-        self.showChatWindow()
-
-    def export_result(self, model_name="model"):
-        # type: (str) -> None
-        """Слот вызова экспорта из контроллера."""
-        from plugin.utils.artifact_exporter import ArtifactExporter
-        results_root = self.settings_mgr.get_results_root_dir()
-        exporter = ArtifactExporter(results_root=results_root, dispatcher=self.dispatcher)
-        try:
-            exporter.export_all_for_model(model_name=model_name, chat_window=self._chat_window)
-            logger.info("Results exported successfully for '%s'", model_name)
-        except Exception as e:
-            logger.exception("Error exporting results for '%s': %s", model_name, e)
+        self._settings_view.show()
 
 
-__all__ = ["STEAIExtension"]
+__all__ = ["STEAIExtension", "AgentBackendAdapter"]

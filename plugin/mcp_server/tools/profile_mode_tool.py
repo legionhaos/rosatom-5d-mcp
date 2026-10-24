@@ -1,24 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-STE Slicer Plugin — Profile & Mode Selection Tool (MCP).
-
-Selects 3D (Planar) vs 5D (Multi-Axis) printing mode, filament material,
-quality/strength profiles, and configures corresponding settings stacks in Uranium/Cura.
-"""
-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import json
-import logging
 import os
-import sys
-from typing import Any, Dict, List, Optional
-
-from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher, run_in_main_thread
-from plugin.utils.exceptions import ProfileNotFoundError, format_exception_for_llm
-from plugin.utils.logger import get_logger
-
-logger = get_logger("ProfileAndModeTool")
+import traceback
+from typing import Any, Dict, Optional
 
 try:
     from plugin.mcp_server.server import BaseMCPTool
@@ -26,265 +12,380 @@ except (ImportError, AttributeError):
     class BaseMCPTool(object):
         name = ""
         description = ""
-        parameters_schema = {}
+        parameters_schema = {}  # type: Dict[str, Any]
 
         def execute(self, **kwargs):
+            # type: (**Any) -> Dict[str, Any]
             raise NotImplementedError
 
+try:
+    from utils.exceptions import (
+        STEPluginError,
+        SceneError,
+        ProfileNotFoundError,
+        format_exception_for_llm,
+    )
+except (ImportError, AttributeError):
+    class STEPluginError(Exception):
+        def __init__(self, message, code="STE_PLUGIN_ERROR", details=None):
+            super(STEPluginError, self).__init__(message)
+            self.code = code
+            self.details = details or {}
+            self.message = message
 
-# Стандартные технологические параметры по материалам и режимам для быстрого применения
-FALLBACK_MATERIAL_PRESETS = {
-    "PLA": {
-        "print_temperature": 205,
-        "bed_temperature": 60,
-        "fan_speed": 100,
-        "speed_print": 60,
-        "retraction_amount": 3.5,
-        "retraction_speed": 40
-    },
-    "PETG": {
-        "print_temperature": 240,
-        "bed_temperature": 75,
-        "fan_speed": 40,
-        "speed_print": 45,
-        "retraction_amount": 4.0,
-        "retraction_speed": 35
-    },
-    "ABS": {
-        "print_temperature": 245,
-        "bed_temperature": 100,
-        "fan_speed": 0,
-        "speed_print": 50,
-        "retraction_amount": 2.5,
-        "retraction_speed": 40
-    },
-    "PA6-CF": {
-        "print_temperature": 280,
-        "bed_temperature": 90,
-        "fan_speed": 0,
-        "speed_print": 35,
-        "retraction_amount": 2.0,
-        "retraction_speed": 30
-    },
-    "TPU": {
-        "print_temperature": 225,
-        "bed_temperature": 50,
-        "fan_speed": 50,
-        "speed_print": 25,
-        "retraction_amount": 1.0,
-        "retraction_speed": 20
-    }
-}
+    class SceneError(STEPluginError):
+        def __init__(self, message, details=None):
+            super(SceneError, self).__init__(message, code="SCENE_ERROR", details=details)
+
+    class ProfileNotFoundError(STEPluginError):
+        def __init__(self, message, details=None):
+            super(ProfileNotFoundError, self).__init__(message, code="PROFILE_NOT_FOUND", details=details)
+
+    def format_exception_for_llm(exc):
+        # type: (BaseException) -> Dict[str, Any]
+        return {
+            "status": "ERROR",
+            "error_code": getattr(exc, "code", type(exc).__name__),
+            "message": str(exc),
+            "details": getattr(exc, "details", {}),
+            "traceback": traceback.format_exc(),
+        }
+
+try:
+    from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
+except (ImportError, AttributeError):
+    class MainThreadDispatcher(object):
+        @staticmethod
+        def run_sync(func, *args, **kwargs):
+            return func(*args, **kwargs)
 
 
-class ProfileAndModeTool(BaseMCPTool):
-    """
-    MCP-инструмент выбора режима печати (3D vs 5D), полимерного материала и профиля качества.
-    """
+_DOMAIN_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "config",
+    "domain_knowledge_3d5d.json"
+)
+
+
+class ProfileModeTool(BaseMCPTool):
 
     name = "select_print_mode_and_profile"
     description = (
-        "Выбирает режим печати (5D Multi-Axis или 3D Planar), базовый профиль качества "
-        "и полимерный материал (PA6-CF, PETG, PLA, ABS, TPU)."
+        "Выбор режима печати (5D Multi-Axis или 3D Planar), активация материала "
+        "филамента и базового профиля качества в STE Slicer на основе базы знаний Stereotech."
     )
 
     parameters_schema = {
         "type": "object",
         "properties": {
-            "print_mode": {
-                "type": "string",
-                "enum": ["5D", "3D"],
-                "description": "Режим печати: '5D' (многоосевой) или '3D' (классический трехосевой)."
-            },
             "mode": {
                 "type": "string",
                 "enum": ["5D", "3D"],
-                "description": "Алиас для print_mode."
-            },
-            "material_type": {
-                "type": "string",
-                "description": "Имя или марка материала (например, 'PA6-CF', 'PETG', 'PLA', 'ABS', 'TPU')."
+                "description": "Режим печати: '5D' (многоосевая) или '3D' (планарная трехосевая)."
             },
             "material": {
                 "type": "string",
-                "description": "Алиас для material_type."
-            },
-            "quality_profile": {
-                "type": "string",
-                "description": "Профиль качества/прочности ('5D_structural', 'normal_strength', 'standard', 'fine')."
+                "description": "Имя материала филамента (PLA, PETG, ABS, TPU, PA6-CF и т.д.)."
             },
             "profile": {
                 "type": "string",
-                "description": "Алиас для quality_profile."
-            },
-            "nozzle_size_mm": {
-                "type": "number",
-                "description": "Диаметр установленного сопла в мм (по умолчанию 0.4).",
-                "default": 0.4
+                "description": "Опциональное имя профиля качества для активации."
             }
         },
-        "required": []
+        "required": ["mode"]
     }
 
-    def __init__(self):
-        super(ProfileAndModeTool, self).__init__()
+    def __init__(self, settings_mgr=None):
+        # type: (Any) -> None
+        self._settings_mgr = settings_mgr
+        self._domain = self._load_domain_knowledge()
 
-    def list_available_configurations(self):
+    def _load_domain_knowledge(self):
         # type: () -> Dict[str, Any]
-        """
-        Опрашивает ContainerRegistry и возвращает список доступных машин,
-        материалов и профилей качества.
-        """
         try:
-            return MainThreadDispatcher.execute_sync(self._list_configurations_main)
-        except Exception as e:
-            logger.debug("list_available_configurations fallback: %s", e)
-            return {
-                "modes": ["5D", "3D"],
-                "materials": ["PA6-CF", "PETG", "PLA", "ABS", "TPU"],
-                "profiles": ["5D_structural", "5D_precision", "normal_strength", "standard", "draft"]
-            }
-
-    def _list_configurations_main(self):
-        # type: () -> Dict[str, Any]
-        result = {
-            "modes": ["5D", "3D"],
-            "materials": [],
-            "profiles": [],
-            "machines": []
-        }
-        try:
-            from UM.Settings.ContainerRegistry import ContainerRegistry
-            registry = ContainerRegistry.getInstance()
-            materials = registry.findInstanceContainers(type="material")
-            result["materials"] = list(set([m.getName() for m in materials if m.getName()]))
-
-            qualities = registry.findInstanceContainers(type="quality")
-            result["profiles"] = list(set([q.getName() for q in qualities if q.getName()]))
-
-            machines = registry.findDefinitionContainers()
-            result["machines"] = [m.getName() for m in machines if m.getName()]
-        except Exception as e:
-            logger.debug("Error listing from ContainerRegistry: %s", e)
-            result["materials"] = ["PA6-CF", "PETG", "PLA", "ABS", "TPU"]
-            result["profiles"] = ["5D_structural", "5D_precision", "normal_strength", "standard"]
-        return result
+            with open(_DOMAIN_FILE, "r") as handle:
+                return json.load(handle)
+        except Exception:
+            return {}
 
     def execute(self, **kwargs):
         # type: (**Any) -> Dict[str, Any]
-        """
-        Выполняет переключение режима, материала и профиля в STE Slicer.
-        """
-        mode = kwargs.get("print_mode") or kwargs.get("mode") or "5D"
-        material = kwargs.get("material_type") or kwargs.get("material") or "PA6-CF"
-        profile = kwargs.get("quality_profile") or kwargs.get("profile") or "5D_structural"
-        nozzle = kwargs.get("nozzle_size_mm", 0.4)
-
-        mode = str(mode).upper()
-        if mode not in ("3D", "5D"):
-            mode = "5D"
-
-        material = str(material).strip()
-        profile = str(profile).strip()
-
         try:
-            return MainThreadDispatcher.execute_sync(
-                self._apply_configuration_main,
-                mode=mode,
-                material=material,
-                profile=profile,
-                nozzle=nozzle
+            mode = kwargs.get("mode")
+            material = kwargs.get("material")
+            profile = kwargs.get("profile")
+
+            if mode not in ("5D", "3D"):
+                raise STEPluginError(
+                    "Недопустимый режим печати '{0}'. Разрешены '5D' или '3D'.".format(mode)
+                )
+
+            result = MainThreadDispatcher.run_sync(
+                self._apply_mode_and_profile, mode, material, profile
             )
+
+            material_spec = self._lookup_material_spec(material) if material else None
+            mode_spec = self._lookup_mode_spec(mode)
+
+            response = {
+                "status": "SUCCESS",
+                "mode": mode,
+                "mode_info": mode_spec,
+                "applied_material": result.get("applied_material"),
+                "applied_profile": result.get("applied_profile"),
+                "material_spec": material_spec,
+                "warnings": result.get("warnings", [])
+            }
+            return response
         except Exception as exc:
-            logger.exception("Failed to apply profile and mode: %s", exc)
             return format_exception_for_llm(exc)
 
-    def _apply_configuration_main(self, mode, material, profile, nozzle):
-        # type: (str, str, str, float) -> Dict[str, Any]
-        app = None
-        applied_mode = mode
-        applied_material = material
-        applied_profile = profile
-        active_machine = "Stereotech Hybrid 530"
+    def _lookup_mode_spec(self, mode):
+        # type: (str) -> Dict[str, Any]
+        rules = self._domain.get("mode_selection_rules", {})
+        return rules.get(mode, {})
 
-        try:
-            from cura.CuraApplication import CuraApplication
-            app = CuraApplication.getInstance()
-        except Exception:
-            pass
+    def _lookup_material_spec(self, material):
+        # type: (str) -> Optional[Dict[str, Any]]
+        catalog = self._domain.get("materials_catalog", {})
+        if not material:
+            return None
+        if material in catalog:
+            return catalog[material]
+        upper = material.upper()
+        for key, spec in catalog.items():
+            if key.upper() == upper:
+                return spec
+        return None
 
-        if app is not None:
-            try:
-                machine_mgr = app.getMachineManager()
-                if machine_mgr:
-                    current_machine = machine_mgr.activeMachine
-                    if current_machine:
-                        active_machine = current_machine.getName()
+    def _apply_mode_and_profile(self, mode, material, profile):
+        # type: (str, Optional[str], Optional[str]) -> Dict[str, Any]
+        from cura.CuraApplication import CuraApplication
 
-                    # Переключение режима 3D / 5D в свойствах машины или стек-переменных
-                    global_stack = machine_mgr.activeMachine
-                    if global_stack:
-                        # В STE Slicer режим 5D активируется через специфичные ключи:
-                        # 'stereotech_5d_mode', 'print_mode' или имя определения машины
-                        for key in ("stereotech_5d_mode", "print_mode", "slicing_mode"):
-                            try:
-                                if global_stack.getProperty(key, "value") is not None:
-                                    val = True if mode == "5D" else False
-                                    if key == "print_mode":
-                                        val = mode
-                                    global_stack.setProperty(key, "value", val)
-                            except Exception:
-                                pass
+        warnings = []
+        app = CuraApplication.getInstance()
+        if not app:
+            raise SceneError("CuraApplication не инициализировано.")
 
-                    # Установка материала
-                    try:
-                        from UM.Settings.ContainerRegistry import ContainerRegistry
-                        registry = ContainerRegistry.getInstance()
-                        # Ищем подходящий контейнер материала
-                        mat_lower = material.lower().replace("-", "").replace("_", "")
-                        matched_container = None
-                        for c in registry.findInstanceContainers(type="material"):
-                            c_name = c.getName().lower().replace("-", "").replace("_", "")
-                            if mat_lower in c_name or c_name in mat_lower:
-                                matched_container = c
-                                break
+        global_stack = app.getGlobalContainerStack()
+        if not global_stack:
+            raise SceneError("Отсутствует активный принтер / GlobalStack.")
 
-                        if matched_container:
-                            try:
-                                from cura.Settings.ExtruderManager import ExtruderManager
-                                extruder_stack = ExtruderManager.getInstance().getActiveExtruderStack()
-                                if extruder_stack:
-                                    extruder_stack.material = matched_container
-                                    applied_material = matched_container.getName()
-                            except Exception as em_err:
-                                logger.debug("ExtruderManager setMaterial notice: %s", em_err)
-                    except Exception as reg_err:
-                        logger.debug("ContainerRegistry lookup notice: %s", reg_err)
+        self._set_print_mode(global_stack, mode, warnings)
 
-            except Exception as e:
-                logger.warning("Error during live Cura stack configuration: %s", e)
+        applied_material = None
+        if material:
+            applied_material = self._activate_material(app, global_stack, material, warnings)
 
-        # Подбираем технологический пресет для выбранного материала
-        mat_key = "PA6-CF"
-        for key in FALLBACK_MATERIAL_PRESETS:
-            if key.lower() in material.lower():
-                mat_key = key
-                break
-        preset = dict(FALLBACK_MATERIAL_PRESETS.get(mat_key, FALLBACK_MATERIAL_PRESETS["PA6-CF"]))
+        applied_profile = None
+        if profile:
+            applied_profile = self._activate_quality_profile(app, global_stack, profile, warnings)
 
         return {
-            "status": "success",
-            "active_machine": active_machine,
-            "applied_mode": applied_mode,
-            "applied_material_id": applied_material,
-            "applied_profile_id": applied_profile,
-            "nozzle_size_mm": nozzle,
-            "default_settings_snapshot": preset,
-            "message": "Режим {0}, материал '{1}' и профиль '{2}' успешно применены.".format(
-                applied_mode, applied_material, applied_profile
-            )
+            "applied_material": applied_material,
+            "applied_profile": applied_profile,
+            "warnings": warnings
         }
 
+    def _set_print_mode(self, global_stack, mode, warnings):
+        # type: (Any, str, list) -> None
+        try:
+            definition = global_stack.getProperty("ste_print_mode", "value")
+        except Exception:
+            definition = None
 
-ProfileModeTool = ProfileAndModeTool
-__all__ = ["ProfileAndModeTool", "ProfileModeTool"]
+        user_container = self._get_user_changes_container(global_stack)
+        if user_container is None:
+            warnings.append("Не найден контейнер userChanges GlobalStack для записи режима печати.")
+            return
+
+        try:
+            user_container.setProperty("ste_print_mode", "value", mode)
+            if hasattr(global_stack, "propertyChanged"):
+                global_stack.propertyChanged.emit("ste_print_mode", "value")
+        except Exception as exc:
+            warnings.append("Не удалось записать ste_print_mode='{0}': {1}".format(mode, exc))
+
+    def _activate_material(self, app, global_stack, material, warnings):
+        # type: (Any, Any, str, list) -> Optional[str]
+        machine_manager = self._get_machine_manager(app)
+
+        containers = self._find_material_containers(app, global_stack, material)
+        if not containers:
+            raise ProfileNotFoundError(
+                "Материал '{0}' не найден в библиотеке материалов STE Slicer.".format(material),
+                details={"requested_material": material}
+            )
+
+        target_container = containers[0]
+        container_id = str(getattr(target_container, "getId", lambda: "")())
+
+        if machine_manager is not None and hasattr(machine_manager, "setMaterial"):
+            try:
+                extruder = self._get_extruder_stack(global_stack)
+                position = str(getattr(extruder, "getMetaDataEntry", lambda k, d=None: "0")("position", "0"))
+                machine_manager.setMaterial(position, target_container)
+                return str(getattr(target_container, "getName", lambda: container_id)())
+            except Exception as exc:
+                warnings.append("MachineManager.setMaterial завершился ошибкой: {0}".format(exc))
+
+        extruder = self._get_extruder_stack(global_stack)
+        if extruder is not None and hasattr(extruder, "material"):
+            try:
+                extruder.material = target_container
+                return str(getattr(target_container, "getName", lambda: container_id)())
+            except Exception as exc:
+                warnings.append("Прямое назначение material в ExtruderStack не удалось: {0}".format(exc))
+
+        warnings.append("Не удалось активировать материал '{0}'.".format(material))
+        return None
+
+    def _activate_quality_profile(self, app, global_stack, profile, warnings):
+        # type: (Any, Any, str, list) -> Optional[str]
+        machine_manager = self._get_machine_manager(app)
+
+        quality_container = self._find_quality_container(app, global_stack, profile)
+        if quality_container is None:
+            warnings.append("Профиль качества '{0}' не найден, пропущен.".format(profile))
+            return None
+
+        qid = str(getattr(quality_container, "getId", lambda: "")())
+
+        if machine_manager is not None and hasattr(machine_manager, "setQualityGroup"):
+            try:
+                machine_manager.setQualityGroup(quality_container)
+                return str(getattr(quality_container, "getName", lambda: qid)())
+            except Exception:
+                pass
+
+        if global_stack is not None and hasattr(global_stack, "quality"):
+            try:
+                global_stack.quality = quality_container
+                return str(getattr(quality_container, "getName", lambda: qid)())
+            except Exception as exc:
+                warnings.append("Назначение профиля качества не удалось: {0}".format(exc))
+
+        return None
+
+    def _get_machine_manager(self, app):
+        # type: (Any) -> Any
+        getter = getattr(app, "getMachineManager", None)
+        if getter is not None:
+            try:
+                return getter()
+            except Exception:
+                return None
+        return getattr(app, "machineManager", None)
+
+    def _get_extruder_stack(self, global_stack):
+        # type: (Any) -> Any
+        extruders = getattr(global_stack, "extruders", None)
+        if extruders:
+            if isinstance(extruders, dict) and len(extruders) > 0:
+                return extruders.get("0") or next(iter(extruders.values()))
+            if isinstance(extruders, (list, tuple)) and len(extruders) > 0:
+                return extruders[0]
+        return None
+
+    def _find_material_containers(self, app, global_stack, material):
+        # type: (Any, Any, str) -> list
+        registry = self._get_container_registry(app)
+        if registry is None:
+            return []
+
+        candidates = []
+        finders = []
+        if hasattr(registry, "findInstanceContainers"):
+            finders.append(registry.findInstanceContainers)
+        if hasattr(registry, "findContainers"):
+            finders.append(registry.findContainers)
+
+        for finder in finders:
+            for query in ({"type": "material", "name": material},
+                          {"type": "material", "id": material},
+                          {"type": "material", "material": material}):
+                try:
+                    found = finder(**query)
+                except Exception:
+                    found = None
+                if found:
+                    candidates.extend(found)
+            if candidates:
+                break
+
+        if not candidates:
+            for finder in finders:
+                try:
+                    all_materials = finder(type="material")
+                except Exception:
+                    all_materials = []
+                upper = material.upper()
+                for cont in all_materials or []:
+                    name = str(getattr(cont, "getName", lambda: "")()).upper()
+                    cid = str(getattr(cont, "getId", lambda: "")()).upper()
+                    if upper in name or upper in cid:
+                        candidates.append(cont)
+                if candidates:
+                    break
+
+        return candidates
+
+    def _find_quality_container(self, app, global_stack, profile):
+        # type: (Any, Any, str) -> Any
+        registry = self._get_container_registry(app)
+        if registry is None:
+            return None
+
+        finders = []
+        if hasattr(registry, "findInstanceContainers"):
+            finders.append(registry.findInstanceContainers)
+        if hasattr(registry, "findContainers"):
+            finders.append(registry.findContainers)
+
+        for finder in finders:
+            for query in ({"type": "quality", "name": profile},
+                          {"type": "quality", "id": profile},
+                          {"type": "quality_changes", "name": profile}):
+                try:
+                    found = finder(**query)
+                except Exception:
+                    found = None
+                if found:
+                    return found[0]
+        return None
+
+    def _get_container_registry(self, app):
+        # type: (Any) -> Any
+        getter = getattr(app, "getContainerRegistry", None)
+        if getter is not None:
+            try:
+                return getter()
+            except Exception:
+                pass
+        try:
+            from UM.Settings.ContainerRegistry import ContainerRegistry
+            return ContainerRegistry.getInstance()
+        except Exception:
+            return None
+
+    def _get_user_changes_container(self, stack):
+        # type: (Any) -> Any
+        if hasattr(stack, "userChanges") and stack.userChanges is not None:
+            return stack.userChanges
+        if hasattr(stack, "userChangesContainer") and stack.userChangesContainer is not None:
+            return stack.userChangesContainer
+        if hasattr(stack, "getContainerCount") and hasattr(stack, "getContainer"):
+            for idx in range(stack.getContainerCount()):
+                container = stack.getContainer(idx)
+                if not container:
+                    continue
+                cid = str(getattr(container, "getId", lambda: "")()).lower()
+                meta_type = str(getattr(container, "getMetaDataEntry", lambda k: "")("type")).lower()
+                if "user" in cid or meta_type == "user":
+                    return container
+        if hasattr(stack, "getTop"):
+            return stack.getTop()
+        return None
+
+
+__all__ = ["ProfileModeTool"]
