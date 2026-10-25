@@ -139,8 +139,11 @@ Window {
     }
 
     function fileCount() {
-        if (root.modelCountVal > 0) return root.modelCountVal;
-        return activeCtrl ? activeCtrl.modelCount : 0;
+        var attachments = activeCtrl ? activeCtrl.attachmentCount : 0;
+        var models = activeCtrl ? activeCtrl.modelCount : 0;
+        var count = Math.max(models, attachments);
+        if (root.modelCountVal > 0) return Math.max(root.modelCountVal, count);
+        return count;
     }
 
     function toolTitle(name) {
@@ -183,12 +186,26 @@ Window {
         finishedTools = 0;
         changeMessages.clear();
         analysisTitle = "Инициализация ИИ-анализа";
-        analysisDetail = "Передаём модель и задачу агенту…";
+        analysisDetail = "Передаём модель и графические материалы агенту…";
         phase = "analyze";
 
-        var promptText = "Проанализируй прикреплённую модель для печати на Stereotech Hybrid 530. Цель: " +
-            selectedGoal + ". " + customGoal.text +
-            ". Определи оптимальный режим 3D/5D, материал, сопло, ориентацию, поддержки, примени ориентацию и параметры к сцене и подготовь инженерное обоснование. Слайсинг пока не запускай.";
+        var hasImages = activeCtrl && activeCtrl.imageCount > 0;
+        var hasModels = activeCtrl && activeCtrl.modelCount > 0;
+        var promptText = "";
+
+        if (hasImages && !hasModels) {
+            promptText = "Проанализируй прикреплённое изображение (рендер детали / фотографию / эскиз) для изготовления на Stereotech Hybrid 530. Цель: " +
+                selectedGoal + ". " + customGoal.text +
+                ". Внимательно изучи форму, определи геометрию детали, оцени возможность и преимущества 3D или 5D печати, подбери оптимальный конструкционный материал, рекомендуемые параметры нарезки и дай инженерные рекомендации по подготовке к печати.";
+        } else if (hasImages && hasModels) {
+            promptText = "Проанализируй прикреплённую 3D-модель в сцене и прикреплённое изображение (рендер / эскиз нагрузок / фото) для печати на Stereotech Hybrid 530. Цель: " +
+                selectedGoal + ". " + customGoal.text +
+                ". Сопоставь 3D-модель со снимком/рендером, учти визуальные особенности с изображения (направление нагрузок, ориентацию, требования к поверхностям), определи оптимальный режим 3D/5D, материал, сопло, ориентацию, поддержки, примени ориентацию и параметры к сцене и подготовь инженерное обоснование. Слайсинг пока не запускай.";
+        } else {
+            promptText = "Проанализируй прикреплённую модель для печати на Stereotech Hybrid 530. Цель: " +
+                selectedGoal + ". " + customGoal.text +
+                ". Определи оптимальный режим 3D/5D, материал, сопло, ориентацию, поддержки, примени ориентацию и параметры к сцене и подготовь инженерное обоснование. Слайсинг пока не запускай.";
+        }
         submitPrompt(promptText);
     }
 
@@ -273,12 +290,19 @@ Window {
 
     FileDialog {
         id: modelDialog
-        title: "Выберите 3D-модель (STL, OBJ, 3MF)"
+        title: "Выберите 3D-модель или изображение/рендер"
         selectMultiple: true
-        nameFilters: ["3D-модели (*.stl *.obj *.3mf)", "Все поддерживаемые файлы (*.stl *.obj *.3mf *.png *.jpg)"]
+        nameFilters: [
+            "Все поддерживаемые файлы (*.stl *.obj *.3mf *.png *.jpg *.jpeg *.bmp *.webp)",
+            "3D-модели (*.stl *.obj *.3mf)",
+            "Изображения и рендеры (*.png *.jpg *.jpeg *.bmp *.webp)"
+        ]
         onAccepted: {
             if (activeCtrl) {
-                for (var i = 0; i < fileUrls.length; i++) activeCtrl.addAttachment(fileUrls[i].toString());
+                for (var i = 0; i < fileUrls.length; i++) {
+                    activeCtrl.addAttachment(fileUrls[i].toString());
+                }
+                root.modelCountVal = activeCtrl.modelCount;
             }
         }
     }
@@ -536,12 +560,26 @@ Window {
 
                     // LEFT: DRAG & DROP & SCENE CARD
                     Rectangle {
+                        id: dropBoxCard
                         width: parent.width * 0.48
                         height: parent.height
                         radius: 12
                         color: dropArea.containsDrag ? "#eff6ff" : "#ffffff"
                         border.color: dropArea.containsDrag ? root.primary : root.border
                         border.width: dropArea.containsDrag ? 2 : 1
+
+                        DropArea {
+                            id: dropArea
+                            anchors.fill: parent
+                            onDropped: {
+                                if (drop.hasUrls && activeCtrl) {
+                                    for (var i = 0; i < drop.urls.length; i++) {
+                                        activeCtrl.addAttachment(drop.urls[i].toString());
+                                    }
+                                    root.modelCountVal = activeCtrl.modelCount;
+                                }
+                            }
+                        }
 
                         Column {
                             anchors.fill: parent
@@ -616,19 +654,6 @@ Window {
                                         }
                                     }
                                 }
-
-                                DropArea {
-                                    id: dropArea
-                                    anchors.fill: parent
-                                    onDropped: {
-                                        if (drop.hasUrls && activeCtrl) {
-                                            for (var i = 0; i < drop.urls.length; i++) {
-                                                activeCtrl.addAttachment(drop.urls[i].toString());
-                                            }
-                                            root.modelCountVal = activeCtrl.modelCount;
-                                        }
-                                    }
-                                }
                             }
 
                             // Scene Detected Notification Card (If models already in slicer)
@@ -647,13 +672,19 @@ Window {
                                     Text { text: "✓"; color: root.success; font.pixelSize: 16; font.bold: true }
                                     Column {
                                         Text {
-                                            text: "Модель готова к анализу: " + fileCount() + " шт."
+                                            text: (activeCtrl && activeCtrl.imageCount > 0 && activeCtrl.modelCount === 0)
+                                                  ? ("Изображение / рендер готов к анализу (" + fileCount() + " шт.)")
+                                                  : ((activeCtrl && activeCtrl.imageCount > 0 && activeCtrl.modelCount > 0)
+                                                     ? ("Модель и рендер готовы к анализу (" + fileCount() + " шт.)")
+                                                     : ("Модель готова к анализу: " + fileCount() + " шт."))
                                             color: "#065f46"
                                             font.pixelSize: 12
                                             font.bold: true
                                         }
                                         Text {
-                                            text: activeCtrl && activeCtrl.dimensionsText ? activeCtrl.dimensionsText : "Габариты детали прочитаны из STE Slicer"
+                                            text: (activeCtrl && activeCtrl.imageCount > 0 && activeCtrl.modelCount === 0)
+                                                  ? "ИИ оценит геометрию, режим 3D/5D и подберёт материал по фото"
+                                                  : (activeCtrl && activeCtrl.dimensionsText ? activeCtrl.dimensionsText : "Габариты детали прочитаны из STE Slicer")
                                             color: "#047857"
                                             font.pixelSize: 10
                                         }
@@ -864,7 +895,7 @@ Window {
                             anchors.centerIn: parent
                             spacing: 8
                             Text {
-                                text: "Начать ИИ-анализ модели"
+                                text: (activeCtrl && activeCtrl.imageCount > 0 && activeCtrl.modelCount === 0) ? "Начать анализ изображения" : "Начать ИИ-анализ модели"
                                 color: "#ffffff"
                                 font.pixelSize: 12
                                 font.bold: true

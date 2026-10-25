@@ -174,11 +174,18 @@ class AgentOrchestrator(object):
                 for m in self.context_mgr.messages
             )
 
+            has_models = bool(
+                snapshot.get("has_models", False) or
+                snapshot.get("model_count", 0) > 0 or
+                getattr(self.context_mgr, "attached_models", [])
+            )
+
             allowed_tools = {"analyze_mesh_geometry", "select_print_mode_and_profile", "modify_scene_and_parameters"}
             step_tools = [t for t in (tools_schema or []) if t.get("function", {}).get("name") in allowed_tools]
 
-            if has_prior_analysis:
-                # In follow-up turns (e.g. asking for adjustments or clarifications), allow LLM to choose tools or reply directly
+            if has_prior_analysis or not has_models:
+                # In follow-up turns OR when only an image is attached without a 3D mesh in the scene,
+                # allow LLM to choose tools or reply directly with visual reasoning
                 current_tool_choice = "auto"
             else:
                 # Automated pipeline on initial turn: geometry -> profile/material -> scene/parameters -> report
@@ -261,7 +268,7 @@ class AgentOrchestrator(object):
 
             else:
                 # If this is an initial pipeline run and the model skipped mandatory tool calls:
-                if not has_prior_analysis and iteration < 4:
+                if not has_prior_analysis and has_models and iteration < 4:
                     if tools_schema and not executed_tools.get("analyze_mesh_geometry"):
                         logger.warning("LLM returned text before mandatory geometry analysis.")
                         self.context_mgr.add_assistant_message(llm_response.content or "")

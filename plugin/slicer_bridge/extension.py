@@ -72,12 +72,13 @@ class AgentBackendAdapter(QObject):
     responseReady = pyqtSignal(object)
     taskFailed = pyqtSignal(str)
 
-    def __init__(self, worker, settings_mgr=None, orchestrator=None, parent=None):
-        # type: (Any, Any, Any, Any) -> None
+    def __init__(self, worker, settings_mgr=None, orchestrator=None, extension=None, parent=None):
+        # type: (Any, Any, Any, Any, Any) -> None
         super(AgentBackendAdapter, self).__init__(parent)
         self._worker = worker
         self._settings_mgr = settings_mgr
         self._orchestrator = orchestrator
+        self._extension = extension
         self._call_names = {}  # type: Dict[str, str]
         self._connect_worker()
 
@@ -104,42 +105,99 @@ class AgentBackendAdapter(QObject):
                 value = value[1:]
         return os.path.normpath(value)
 
+    def _get_application(self):
+        if self._extension is not None:
+            getter = getattr(self._extension, "_application", None)
+            if callable(getter):
+                return getter()
+        try:
+            from UM.Application import Application
+            return Application.getInstance()
+        except Exception:
+            return None
+
+    def _is_model_already_in_scene(self, path):
+        try:
+            app = self._get_application()
+            if app is None:
+                return False
+            controller = getattr(app, "getController", lambda: None)()
+            scene = controller.getScene() if controller else None
+            if scene is None:
+                return False
+            root = scene.getRoot()
+            if root is None:
+                return False
+            base_name = os.path.splitext(os.path.basename(path))[0].lower()
+            for node in root.getAllChildren():
+                node_type = type(node).__name__.lower()
+                node_name = str(getattr(node, "getName", lambda: "")() or "").lower()
+                helper_tokens = ("buildplate", "build_plate", "build plate", "grid", "convexhull", "convex_hull", "hull")
+                if any(token in node_type or token in node_name for token in helper_tokens):
+                    continue
+                if hasattr(node, "callDecoration"):
+                    try:
+                        if node.callDecoration("isNonPrintingMesh"):
+                            continue
+                    except Exception:
+                        pass
+                if hasattr(node, "getMeshData") and node.getMeshData() is not None:
+                    if not base_name or base_name in node_name:
+                        return True
+        except Exception:
+            pass
+        return False
+
     def _load_model_attachment(self, path):
-        app = self._extension._application()
+        if self._is_model_already_in_scene(path):
+            return True
+
+        app = self._get_application()
         if app is None:
-            raise RuntimeError("Приложение слайсера недоступно; модель не загружена.")
-        controller = getattr(app, "getController", lambda: None)()
-        scene = controller.getScene() if controller else None
-        if scene is None:
-            raise RuntimeError("Сцена слайсера недоступна; модель не загружена.")
+            logger.warning("AgentBackendAdapter: Application is None, cannot load %s", path)
+            return False
 
-        root = scene.getRoot()
-        handler = getattr(app, "getMeshFileHandler", lambda: None)()
-        if handler is None:
-            raise RuntimeError("MeshFileHandler недоступен; модель не загружена.")
-        reader = getattr(handler, "read", None)
-        if not callable(reader):
-            raise RuntimeError("MeshFileHandler.read недоступен в этой версии слайсера.")
+        try:
+            from PyQt5.QtCore import QUrl
+            qurl = QUrl.fromLocalFile(path)
+        except Exception:
+            qurl = path
 
-        before = set()
-        for node in root.getAllChildren():
-            if hasattr(node, "getMeshData") and node.getMeshData() is not None:
-                before.add(id(node))
-        loaded = reader(path)
-        nodes = loaded if isinstance(loaded, (list, tuple)) else ([loaded] if loaded is not None else [])
-        if not nodes:
-            nodes = [node for node in root.getAllChildren()
-                     if hasattr(node, "getMeshData") and node.getMeshData() is not None and id(node) not in before]
-        if not nodes:
-            raise RuntimeError("Слайсер не вернул загруженную модель и в сцене не появился mesh.")
+        loaded = False
+        read_local = getattr(app, "readLocalFile", None)
+        if callable(read_local):
+            try:
+                read_local(qurl)
+                loaded = True
+                logger.info("AgentBackendAdapter loaded model via Application.readLocalFile: %s", path)
+            except Exception as e:
+                logger.warning("AgentBackendAdapter: Application.readLocalFile failed: %s", e)
 
-        for node in nodes:
-            if node is None:
-                continue
-            parent = getattr(node, "getParent", lambda: None)()
-            if parent is None:
-                root.addChild(node)
-        return True
+        if not loaded:
+            get_mesh_handler = getattr(app, "getMeshFileHandler", None)
+            if callable(get_mesh_handler):
+                handler = get_mesh_handler()
+                if handler is not None and hasattr(handler, "readLocalFile"):
+                    try:
+                        handler.readLocalFile(qurl)
+                        loaded = True
+                        logger.info("AgentBackendAdapter loaded model via MeshFileHandler: %s", path)
+                    except Exception as e:
+                        logger.warning("AgentBackendAdapter: MeshFileHandler.readLocalFile failed: %s", e)
+
+        if not loaded and os.path.splitext(path)[1].lower() == ".3mf":
+            get_ws_handler = getattr(app, "getWorkspaceFileHandler", None)
+            if callable(get_ws_handler):
+                handler = get_ws_handler()
+                if handler is not None and hasattr(handler, "readLocalFile"):
+                    try:
+                        handler.readLocalFile(qurl)
+                        loaded = True
+                        logger.info("AgentBackendAdapter loaded 3mf via WorkspaceFileHandler: %s", path)
+                    except Exception as e:
+                        logger.warning("AgentBackendAdapter: WorkspaceFileHandler.readLocalFile failed: %s", e)
+
+        return loaded
 
     def send_prompt(self, text, attachments=None):
         # type: (str, Optional[List[str]]) -> None
@@ -151,12 +209,23 @@ class AgentBackendAdapter(QObject):
             for raw_path in attachments or []:
                 path = self._local_file_path(raw_path)
                 if not os.path.isfile(path):
-                    raise RuntimeError("Файл модели не найден: {0}".format(path))
+                    if os.path.isfile(raw_path):
+                        path = raw_path
+                    else:
+                        raise RuntimeError("Файл модели не найден: {0}".format(path or raw_path))
                 if os.path.splitext(path)[1].lower() in (".stl", ".obj", ".3mf"):
-                    self._extension._dispatcher.run_sync(self._load_model_attachment, path)
+                    if not self._is_model_already_in_scene(path):
+                        try:
+                            from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
+                            if MainThreadDispatcher.is_main_thread():
+                                self._load_model_attachment(path)
+                            else:
+                                MainThreadDispatcher.execute_sync(lambda: self._load_model_attachment(path), timeout=10.0)
+                        except Exception as load_err:
+                            logger.warning("Could not auto-load attachment to scene: %s", load_err)
                 paths.append(path)
         except Exception as exc:
-            logger.exception("Failed loading model attachment: %s", exc)
+            logger.exception("Failed validating model attachment: %s", exc)
             self.taskFailed.emit("Не удалось загрузить модель: {0}".format(exc))
             return
         try:
@@ -356,6 +425,7 @@ class STEAIExtension(QObject, Extension):
                 self._worker,
                 settings_mgr=self._settings_mgr,
                 orchestrator=self._orchestrator,
+                extension=self,
             )
         except Exception as exc:
             logger.error("Не удалось создать AgentBackendAdapter: %s", exc)

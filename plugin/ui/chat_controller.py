@@ -247,6 +247,18 @@ class ChatController(QObject):
             self._model_count = live
         return self._model_count
 
+    @pyqtProperty(int, notify=modelCountChanged)
+    def imageCount(self):
+        return self._attached_image_count()
+
+    @pyqtProperty(int, notify=modelCountChanged)
+    def attachmentCount(self):
+        return len(self._attachments.paths())
+
+    @pyqtProperty(bool, notify=modelCountChanged)
+    def hasAttachments(self):
+        return len(self._attachments.paths()) > 0
+
     @pyqtProperty(str, notify=previewChanged)
     def previewUrl(self):
         return self._preview_url
@@ -604,6 +616,117 @@ class ChatController(QObject):
         except Exception as exc:
             self._fail("Не удалось отправить запрос агенту: {0}".format(exc))
 
+    @pyqtSlot(str, result=bool)
+    def loadModelFileToScene(self, path):
+        """Automatically load a 3D model file (.stl, .obj, .3mf) onto the STE Slicer build plate."""
+        raw_path = str(path or "").strip()
+        if raw_path.startswith("file:"):
+            parsed = urlparse(raw_path)
+            path = unquote(parsed.path or "")
+            if parsed.netloc and parsed.netloc.lower() != "localhost":
+                path = "//{0}{1}".format(parsed.netloc, path)
+            elif len(path) >= 3 and path[0] == "/" and path[2] == ":":
+                path = path[1:]
+        else:
+            path = raw_path
+        path = os.path.normpath(path)
+        if not path or not os.path.isfile(path):
+            logger.warning("loadModelFileToScene: file does not exist: %s", path)
+            return False
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".stl", ".obj", ".3mf"):
+            return False
+
+        app = self._get_application_instance()
+        if app is None:
+            logger.debug("loadModelFileToScene: Slicer application instance not found (running standalone).")
+            return False
+
+        def _do_load():
+            try:
+                from PyQt5.QtCore import QUrl
+            except ImportError:
+                try:
+                    from PySide2.QtCore import QUrl
+                except ImportError:
+                    QUrl = None
+
+            qurl = QUrl.fromLocalFile(path) if QUrl is not None else path
+
+            loaded = False
+            read_local = getattr(app, "readLocalFile", None)
+            if read_local is not None:
+                try:
+                    read_local(qurl, True)
+                    loaded = True
+                    logger.info("Loaded model onto build plate via app.readLocalFile(qurl, True): %s", path)
+                except TypeError:
+                    try:
+                        read_local(qurl)
+                        loaded = True
+                        logger.info("Loaded model onto build plate via app.readLocalFile(qurl): %s", path)
+                    except Exception as exc:
+                        logger.warning("app.readLocalFile(qurl) failed: %s", exc)
+                except Exception as exc:
+                    logger.warning("app.readLocalFile(qurl, True) failed: %s", exc)
+
+            if not loaded and read_local is not None:
+                try:
+                    read_local(path, True)
+                    loaded = True
+                    logger.info("Loaded model via path string: %s", path)
+                except TypeError:
+                    try:
+                        read_local(path)
+                        loaded = True
+                        logger.info("Loaded model via path string: %s", path)
+                    except Exception as exc:
+                        logger.warning("app.readLocalFile(path) failed: %s", exc)
+                except Exception as exc:
+                    logger.warning("app.readLocalFile(path, True) failed: %s", exc)
+
+            if not loaded:
+                get_mesh_handler = getattr(app, "getMeshFileHandler", None)
+                if get_mesh_handler is not None:
+                    handler = get_mesh_handler()
+                    if handler is not None and hasattr(handler, "readLocalFile"):
+                        try:
+                            handler.readLocalFile(qurl)
+                            loaded = True
+                            logger.info("Loaded model via MeshFileHandler.readLocalFile: %s", path)
+                        except Exception as exc:
+                            logger.warning("MeshFileHandler.readLocalFile failed: %s", exc)
+
+            if not loaded and ext == ".3mf":
+                get_ws_handler = getattr(app, "getWorkspaceFileHandler", None)
+                if get_ws_handler is not None:
+                    handler = get_ws_handler()
+                    if handler is not None and hasattr(handler, "readLocalFile"):
+                        try:
+                            handler.readLocalFile(qurl)
+                            loaded = True
+                            logger.info("Loaded 3MF project via WorkspaceFileHandler: %s", path)
+                        except Exception as exc:
+                            logger.warning("WorkspaceFileHandler.readLocalFile failed: %s", exc)
+
+            return loaded
+
+        try:
+            from ..slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
+            if MainThreadDispatcher.is_main_thread():
+                result = _do_load()
+            else:
+                result = MainThreadDispatcher.execute_sync(_do_load, timeout=10.0)
+        except Exception as exc:
+            logger.warning("loadModelFileToScene dispatch error: %s", exc)
+            result = False
+
+        self.refreshModelCount()
+        self.modelCountChanged.emit()
+        self.refreshPreview()
+        return result
+
     @pyqtSlot(str)
     def addAttachment(self, path):
         raw_path = str(path or "").strip()
@@ -622,14 +745,21 @@ class ChatController(QObject):
             return
         extension = os.path.splitext(path)[1].lower()
         model_extensions = (".stl", ".obj", ".3mf")
-        image_extensions = (".jpg", ".jpeg", ".png")
+        image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
         if extension not in model_extensions + image_extensions:
             self._fail("Формат не поддерживается: {0}".format(extension))
             return
         kind = "model" if extension in model_extensions else "image"
         size = os.path.getsize(path)
         size_text = "{0:.1f} KB".format(size / 1024.0) if size < 1024 * 1024 else "{0:.1f} MB".format(size / 1024.0 / 1024.0)
-        self._attachments.append_file(os.path.basename(path), path, kind, size_text)
+
+        existing_paths = [os.path.normcase(p) for p in self._attachments.paths()]
+        if os.path.normcase(path) not in existing_paths:
+            self._attachments.append_file(os.path.basename(path), path, kind, size_text)
+
+        if kind == "model":
+            self.loadModelFileToScene(path)
+
         self.refreshModelCount()
         self.modelCountChanged.emit()
         self.messageAdded.emit()
@@ -637,6 +767,9 @@ class ChatController(QObject):
 
     def _attached_model_count(self):
         return len([p for p in self._attachments.paths() if os.path.splitext(p)[1].lower() in (".stl", ".obj", ".3mf")])
+
+    def _attached_image_count(self):
+        return len([p for p in self._attachments.paths() if os.path.splitext(p)[1].lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp")])
 
     def _scene_model_count(self):
         return len(self._scene_nodes())
@@ -772,9 +905,20 @@ class ChatController(QObject):
             return
         nodes = self._scene_nodes()
         if not nodes:
+            images = [p for p in self._attachments.paths() if os.path.splitext(p)[1].lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp")]
+            if images:
+                last_img = images[-1]
+                url = QUrl.fromLocalFile(last_img).toString() if QUrl is not None else "file:///" + last_img.replace("\\", "/")
+                self._dimensions_text = "Прикреплён рендер/эскиз"
+                self._set_preview(url, "Прикреплено изображение: " + os.path.basename(last_img), "Визуальный анализ эскиза / фото")
+                return
+            self._dimensions_text = ""
             self._set_preview("", "Загрузите модель STL/3MF на стол STE Slicer", "")
             return
         info = self._describe_models(nodes)
+        images = [p for p in self._attachments.paths() if os.path.splitext(p)[1].lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp")]
+        if images:
+            self._dimensions_text = (self._dimensions_text or "") + " (+ рендер/фото)"
         self._rendering_preview = True
         try:
             if self._slicer is not None and hasattr(self._slicer, "focus_on_build_plate"):
@@ -892,6 +1036,7 @@ class ChatController(QObject):
         self._model_count = self._attached_model_count()
         self.refreshModelCount()
         self.modelCountChanged.emit()
+        self.refreshPreview()
 
     @pyqtSlot()
     def clearConversation(self):
