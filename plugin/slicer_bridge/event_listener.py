@@ -167,23 +167,35 @@ class SlicerEventListener(QObject):
         self._slicing_result = None
         self._slicing_done.clear()
 
-    def wait_for_slicing(self, timeout_sec=90.0):
+    def wait_for_slicing(self, timeout_sec=480.0):
         # type: (float) -> bool
         import time
         deadline = time.time() + float(timeout_sec)
         while time.time() < deadline:
             if self._slicing_done.wait(timeout=0.5):
                 return self._slicing_result is True
-            # Fallback check: if scene already has gcode, slicing is completed!
+            # Fallback check: if backend is done and scene has actual model gcode layers
             app = self._application()
             if app is not None:
                 try:
-                    scene = app.getController().getScene()
-                    gcode_dict = getattr(scene, "gcode_dict", {})
-                    if gcode_dict and any(gcode_dict.values()):
-                        self._slicing_result = True
-                        self._slicing_done.set()
-                        return True
+                    backend = getattr(app, "getBackend", lambda: None)()
+                    is_busy = False
+                    if backend is not None:
+                        state = getattr(backend, "getState", lambda: None)()
+                        state_name = str(getattr(state, "name", state)).lower()
+                        if "processing" in state_name or "slicing" in state_name:
+                            is_busy = True
+                    if not is_busy:
+                        scene = app.getController().getScene()
+                        gcode_dict = getattr(scene, "gcode_dict", {})
+                        if gcode_dict:
+                            for chunks in gcode_dict.values():
+                                for chunk in chunks or []:
+                                    c_str = str(chunk)
+                                    if ";TYPE:WALL-OUTER" in c_str or ";TYPE:WALL-INNER" in c_str or ";TYPE:FILL" in c_str or ";TYPE:SKIN" in c_str:
+                                        self._slicing_result = True
+                                        self._slicing_done.set()
+                                        return True
                 except Exception:
                     pass
         return False

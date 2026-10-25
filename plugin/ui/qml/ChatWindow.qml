@@ -1683,7 +1683,7 @@ Window {
                                 font.pixelSize: 13
                             }
                             Text {
-                                text: "Экспорт (3MF и G-код)"
+                                text: "Экспорт (3MF + скриншот)"
                                 color: "#ffffff"
                                 font.pixelSize: 12
                                 font.bold: true
@@ -1969,7 +1969,7 @@ Window {
                                     font.bold: true
                                 }
                                 Text {
-                                    text: "Автоматически сохранит project.3mf, result.gcode и скриншот диалога в results/<model>/"
+                                    text: "Автоматически сохранит project.3mf и скриншот диалога в results/<model>/"
                                     color: "#3b82f6"
                                     font.pixelSize: 10
                                 }

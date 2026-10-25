@@ -1204,6 +1204,7 @@ class ChatController(QObject):
                 mcp_server=mcp,
                 chat_window=chat_window,
                 dispatcher=MainThreadDispatcher,
+                timeout_sec=480,
                 parent=self
             )
             self._export_worker.progressChanged.connect(self._on_export_progress)

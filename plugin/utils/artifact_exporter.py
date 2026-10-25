@@ -250,18 +250,43 @@ class ArtifactExporter(object):
         path = os.path.join(model_dir, SCREENSHOT_PATTERN % index)
 
         def _grab():
-            if window is None:
-                return None
             try:
-                image = window.grabWindow()
-                if image is None or image.isNull():
-                    return None
-                if not image.save(path, "PNG"):
-                    return None
-                return path
+                # 1. Direct window grab
+                if window is not None:
+                    if hasattr(window, "grabWindow"):
+                        img = window.grabWindow()
+                        if img is not None and not img.isNull() and img.save(path, "PNG"):
+                            return path
+                    if hasattr(window, "grab"):
+                        pix = window.grab()
+                        if pix is not None and not pix.isNull() and pix.save(path, "PNG"):
+                            return path
+
+                # 2. Try activeWindow or top-level windows from QApplication
+                try:
+                    from PyQt5.QtWidgets import QApplication
+                    app = QApplication.instance()
+                    if app is not None:
+                        for win in getattr(app, "topLevelWindows", lambda: [])():
+                            if getattr(win, "isVisible", lambda: False)() and hasattr(win, "grabWindow"):
+                                img = win.grabWindow()
+                                if img is not None and not img.isNull() and img.save(path, "PNG"):
+                                    return path
+                        focus_w = getattr(app, "activeWindow", lambda: None)()
+                        if focus_w is not None and hasattr(focus_w, "grab"):
+                            pix = focus_w.grab()
+                            if pix is not None and not pix.isNull() and pix.save(path, "PNG"):
+                                return path
+                        screen = getattr(app, "primaryScreen", lambda: None)()
+                        if screen is not None and hasattr(screen, "grabWindow"):
+                            pix = screen.grabWindow(0)
+                            if pix is not None and not pix.isNull() and pix.save(path, "PNG"):
+                                return path
+                except Exception:
+                    pass
             except Exception as e:
                 STEPluginLogger.warning("Не удалось сохранить скриншот: %s" % e, tag="EXPORT")
-                return None
+            return None
 
         try:
             return self._on_main(_grab)
@@ -352,13 +377,12 @@ class ArtifactExporter(object):
         return report
 
     # ------------------------------ сборка -------------------------------- #
-    def export_all_for_model(self, model_name, chat_window=None, validate=True, target_dir=None):
-        # type: (str, Any, bool, Optional[str]) -> Dict[str, Any]
-        """Полный экспорт: папка + project.3mf + result.gcode (+ chat_N.png) + валидация.
+    def export_all_for_model(self, model_name, chat_window=None, validate=True, target_dir=None, require_gcode=False):
+        # type: (str, Any, bool, Optional[str], bool) -> Dict[str, Any]
+        """Полный экспорт: папка + project.3mf + chat_N.png (+ опционально result.gcode).
 
         Возвращает {"directory","project_3mf","result_gcode","chat_screenshot","validation"}.
-        Если validate=True и проверка не пройдена — бросает ArtifactValidationError
-        (с отчётом в details), чтобы агент мог перезапустить слайсинг."""
+        """
         if target_dir:
             model_dir = os.path.abspath(target_dir)
             try:
@@ -370,22 +394,40 @@ class ArtifactExporter(object):
         path_3mf = os.path.join(model_dir, PROJECT_FILE)
         path_gcode = os.path.join(model_dir, GCODE_FILE)
 
-        self.save_gcode_result(path_gcode)
+        # 1. Сохраняем 3MF проект
         self.save_3mf_project(path_3mf)
 
+        # 2. Сохраняем скриншот чата
         screenshot = None
-        if chat_window is not None:
-            try:
-                screenshot = self.save_chat_screenshot(chat_window, model_dir)
-            except Exception as e:  # скриншот не должен валить весь экспорт
-                STEPluginLogger.warning("Скриншот не сохранён: %s" % e, tag="EXPORT")
+        try:
+            screenshot = self.save_chat_screenshot(chat_window, model_dir)
+        except Exception as e:
+            STEPluginLogger.warning("Скриншот не сохранён: %s" % e, tag="EXPORT")
 
-        result = {"directory": model_dir, "project_3mf": path_3mf, "result_gcode": path_gcode,
-                  "chat_screenshot": screenshot, "validation": None}
+        # 3. G-code: сохраняем, если он есть в сцене, но не валим процесс при его отсутствии
+        saved_gcode = None
+        try:
+            if self.save_gcode_result(path_gcode):
+                saved_gcode = path_gcode
+        except Exception as e:
+            if require_gcode:
+                raise
+            STEPluginLogger.info("G-code пропущен (экспорт в режиме 3MF + скриншот): %s" % e, tag="EXPORT")
+
+        result = {
+            "directory": model_dir,
+            "project_3mf": path_3mf,
+            "result_gcode": saved_gcode,
+            "chat_screenshot": screenshot,
+            "validation": None
+        }
         if validate:
-            report = self.validate_gcode_and_3mf(path_3mf, path_gcode)
+            report = self.validate_gcode_and_3mf(path_3mf, saved_gcode or "")
+            if not require_gcode:
+                report["errors"] = [err for err in report.get("errors", []) if "result.gcode" not in err]
+                report["passed"] = len(report["errors"]) == 0
             result["validation"] = report
-            for w in report["warnings"]:
+            for w in report.get("warnings", []):
                 STEPluginLogger.warning(w, tag="EXPORT")
             if not report["passed"]:
                 raise ArtifactValidationError(

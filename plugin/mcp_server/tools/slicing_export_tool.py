@@ -104,7 +104,7 @@ class SlicingTool(BaseMCPTool):
         "properties": {
             "timeout_sec": {
                 "type": "number",
-                "description": "Максимальное время ожидания завершения слайсинга в секундах (по умолчанию 90)."
+                "description": "Максимальное время ожидания завершения слайсинга в секундах (по умолчанию 480)."
             }
         },
         "required": []
@@ -117,7 +117,7 @@ class SlicingTool(BaseMCPTool):
     def execute(self, **kwargs):
         # type: (**Any) -> Dict[str, Any]
         try:
-            timeout_sec = float(kwargs.get("timeout_sec", 90.0))
+            timeout_sec = float(kwargs.get("timeout_sec", 480.0))
             if timeout_sec <= 0 or timeout_sec > 3600:
                 raise SlicingTimeoutError("timeout_sec должен быть в диапазоне (0, 3600].")
 
