@@ -55,17 +55,26 @@ class SlicerEventListener(QObject):
         super(SlicerEventListener, self).__init__(parent)
         self._app = application
         self._slicing_done = threading.Event()
+        self._slicing_result = None
         self._last_backend_state = None
         self._attached = False
 
     def _application(self):
         if self._app is not None:
             return self._app
-        try:
-            from cura.CuraApplication import CuraApplication
-            self._app = CuraApplication.getInstance()
-        except Exception:
-            self._app = None
+        for mod_name in ("steslicer.SteSlicerApplication", "cura.CuraApplication", "UM.Application"):
+            try:
+                mod = __import__(mod_name, fromlist=["SteSlicerApplication", "CuraApplication", "Application"])
+                for attr in ("SteSlicerApplication", "CuraApplication", "Application"):
+                    cls_ = getattr(mod, attr, None)
+                    if cls_ and hasattr(cls_, "getInstance"):
+                        inst = cls_.getInstance()
+                        if inst:
+                            self._app = inst
+                            return self._app
+            except Exception:
+                pass
+        self._app = None
         return self._app
 
     def attach_signals(self):
@@ -132,6 +141,7 @@ class SlicerEventListener(QObject):
 
     def _on_slicing_finished(self, backend=None):
         # type: (Any) -> None
+        self._slicing_result = True
         self._slicing_done.set()
         try:
             self.slicingFinishedSignal.emit()
@@ -140,6 +150,7 @@ class SlicerEventListener(QObject):
 
     def _on_slicing_failed(self, message):
         # type: (str) -> None
+        self._slicing_result = False
         self._slicing_done.set()
         try:
             self.slicingFailedSignal.emit(str(message))
@@ -148,15 +159,34 @@ class SlicerEventListener(QObject):
 
     def _on_slicing_cancelled(self):
         # type: () -> None
+        self._slicing_result = False
         self._slicing_done.set()
 
     def reset(self):
         # type: () -> None
+        self._slicing_result = None
         self._slicing_done.clear()
 
     def wait_for_slicing(self, timeout_sec=90.0):
         # type: (float) -> bool
-        return self._slicing_done.wait(timeout=timeout_sec)
+        import time
+        deadline = time.time() + float(timeout_sec)
+        while time.time() < deadline:
+            if self._slicing_done.wait(timeout=0.5):
+                return self._slicing_result is True
+            # Fallback check: if scene already has gcode, slicing is completed!
+            app = self._application()
+            if app is not None:
+                try:
+                    scene = app.getController().getScene()
+                    gcode_dict = getattr(scene, "gcode_dict", {})
+                    if gcode_dict and any(gcode_dict.values()):
+                        self._slicing_result = True
+                        self._slicing_done.set()
+                        return True
+                except Exception:
+                    pass
+        return False
 
 
 __all__ = ["SlicerEventListener"]

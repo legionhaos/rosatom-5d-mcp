@@ -236,8 +236,15 @@ class STEPluginLogger(object):
 
 def get_logger(name=None):
     """Возвращает стандартный logging.Logger с автоинициализацией STEPluginLogger."""
-    STEPluginLogger._ensure_file_logger()
-    return logging.getLogger(name or "ste_ai_assistant")
+    main_logger = STEPluginLogger._ensure_file_logger()
+    logger_name = name or "ste_ai_assistant"
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.DEBUG)
+    if main_logger and not logger.handlers:
+        for h in getattr(main_logger, "handlers", []):
+            if h not in logger.handlers:
+                logger.addHandler(h)
+    return logger
 
 
 __all__ = ["STEPluginLogger", "mask_secrets", "get_logger"]

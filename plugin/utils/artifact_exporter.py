@@ -51,8 +51,18 @@ class ArtifactExporter(object):
 
     @staticmethod
     def _get_application():
-        from cura.CuraApplication import CuraApplication
-        return CuraApplication.getInstance()
+        for mod_name in ("steslicer.SteSlicerApplication", "cura.CuraApplication", "UM.Application"):
+            try:
+                mod = __import__(mod_name, fromlist=["SteSlicerApplication", "CuraApplication", "Application"])
+                for attr in ("SteSlicerApplication", "CuraApplication", "Application"):
+                    cls_ = getattr(mod, attr, None)
+                    if cls_ and hasattr(cls_, "getInstance"):
+                        inst = cls_.getInstance()
+                        if inst:
+                            return inst
+            except Exception:
+                pass
+        return None
 
     def prepare_model_dir(self, model_name):
         # type: (str) -> str
@@ -140,7 +150,15 @@ class ArtifactExporter(object):
         # type: (Any, str) -> str
         """Скриншот окна (QQuickWindow/QWindow) в chat_N.png со следующим свободным N."""
         existing = glob.glob(os.path.join(model_dir, "chat_*.png"))
-        path = os.path.join(model_dir, SCREENSHOT_PATTERN % (len(existing) + 1))
+        used = set()
+        for item in existing:
+            match = re.search(r"chat_(\d+)\.png$", os.path.basename(item))
+            if match:
+                used.add(int(match.group(1)))
+        index = 1
+        while index in used:
+            index += 1
+        path = os.path.join(model_dir, SCREENSHOT_PATTERN % index)
 
         def _grab():
             image = window.grabWindow()
@@ -222,25 +240,32 @@ class ArtifactExporter(object):
         return {"passed": not errors, "errors": errors, "warnings": warnings,
                 "checks": checks, "gcode_stats": stats}
 
-    def verify_model_dir(self, model_name):
-        # type: (str) -> Dict[str, Any]
-        """Проверка уже собранной папки results/<model_name>/ (для QA перед сдачей)."""
+    def verify_model_dir(self, model_name, require_screenshot=False):
+        # type: (str, bool) -> Dict[str, Any]
+        """Проверка результатов; screenshot требуется только по явному запросу."""
         d = os.path.join(self._root, sanitize_model_name(model_name))
         report = self.validate_gcode_and_3mf(os.path.join(d, PROJECT_FILE), os.path.join(d, GCODE_FILE))
-        if not glob.glob(os.path.join(d, "chat_*.png")):
+        if require_screenshot and not glob.glob(os.path.join(d, "chat_*.png")):
             report["errors"].append("Нет ни одного скриншота chat_*.png")
             report["passed"] = False
         return report
 
     # ------------------------------ сборка -------------------------------- #
-    def export_all_for_model(self, model_name, chat_window=None, validate=True):
-        # type: (str, Any, bool) -> Dict[str, Any]
+    def export_all_for_model(self, model_name, chat_window=None, validate=True, target_dir=None):
+        # type: (str, Any, bool, Optional[str]) -> Dict[str, Any]
         """Полный экспорт: папка + project.3mf + result.gcode (+ chat_N.png) + валидация.
 
         Возвращает {"directory","project_3mf","result_gcode","chat_screenshot","validation"}.
         Если validate=True и проверка не пройдена — бросает ArtifactValidationError
         (с отчётом в details), чтобы агент мог перезапустить слайсинг."""
-        model_dir = self.prepare_model_dir(model_name)
+        if target_dir:
+            model_dir = os.path.abspath(target_dir)
+            try:
+                os.makedirs(model_dir, exist_ok=True)
+            except OSError as e:
+                raise ArtifactExportError("Не удалось создать папку %s: %s" % (model_dir, e))
+        else:
+            model_dir = self.prepare_model_dir(model_name)
         path_3mf = os.path.join(model_dir, PROJECT_FILE)
         path_gcode = os.path.join(model_dir, GCODE_FILE)
 

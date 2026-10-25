@@ -26,6 +26,24 @@ Window {
     color: "#f8fafc"
     flags: Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
 
+    property int modelCountVal: activeCtrl ? activeCtrl.modelCount : 0
+
+    onVisibleChanged: {
+        if (visible && activeCtrl) {
+            activeCtrl.refreshModelCount();
+            root.modelCountVal = activeCtrl.modelCount;
+            activeCtrl.refreshPreview();
+        }
+    }
+
+    Component.onCompleted: {
+        if (activeCtrl) {
+            activeCtrl.refreshModelCount();
+            root.modelCountVal = activeCtrl.modelCount;
+            activeCtrl.refreshPreview();
+        }
+    }
+
     // Design Tokens & Color Palette
     readonly property color ink: "#0f172a"
     readonly property color bodyText: "#334155"
@@ -121,7 +139,8 @@ Window {
     }
 
     function fileCount() {
-        return activeCtrl ? activeCtrl.modelCount : 0
+        if (root.modelCountVal > 0) return root.modelCountVal;
+        return activeCtrl ? activeCtrl.modelCount : 0;
     }
 
     function toolTitle(name) {
@@ -143,10 +162,6 @@ Window {
     function cancelTask() {
         if (activeCtrl) activeCtrl.cancelRequest();
         phase = phase === "apply" ? "recommend" : "upload";
-    }
-
-    onVisibleChanged: {
-        if (visible && activeCtrl) activeCtrl.refreshPreview();
     }
 
     Timer {
@@ -229,6 +244,19 @@ Window {
     }
 
     FileDialog {
+        id: exportFolderDialog
+        title: "Выберите папку для сохранения G-code и 3MF проекта"
+        selectFolder: true
+        selectExisting: true
+        onAccepted: {
+            var selected = (fileUrl && fileUrl.toString().length > 0) ? fileUrl.toString() : folder.toString();
+            if (activeCtrl) {
+                activeCtrl.exportResultToFolder(selected, "model_submission");
+            }
+        }
+    }
+
+    FileDialog {
         id: modelDialog
         title: "Выберите 3D-модель (STL, OBJ, 3MF)"
         selectMultiple: true
@@ -244,6 +272,10 @@ Window {
 
     Connections {
         target: activeCtrl
+
+        onModelCountChanged: {
+            root.modelCountVal = activeCtrl ? activeCtrl.modelCount : 0;
+        }
 
         onTaskStarted: {
             if (root.phase === "analyze") {
@@ -286,11 +318,33 @@ Window {
         id: header
         anchors.top: parent.top
         width: parent.width
-        height: 66
+        height: 48
         color: "#ffffff"
         border.color: root.border
         border.width: 1
         z: 10
+
+        MouseArea {
+            id: headerDragArea
+            anchors.fill: parent
+            z: 0
+            cursorShape: pressed ? Qt.ClosedHandCursor : Qt.SizeAllCursor
+            property real lastMouseX: 0
+            property real lastMouseY: 0
+
+            onPressed: {
+                lastMouseX = mouse.x;
+                lastMouseY = mouse.y;
+            }
+
+            onPositionChanged: {
+                if (!pressed) return;
+                root.x += mouse.x - lastMouseX;
+                root.y += mouse.y - lastMouseY;
+                lastMouseX = mouse.x;
+                lastMouseY = mouse.y;
+            }
+        }
 
         RowLayout {
             anchors.fill: parent
@@ -331,152 +385,20 @@ Window {
                 }
             }
 
-            Item { width: 10; height: 1 }
-
-            // Workflow Stage Stepper
-            Row {
-                spacing: 6
-                anchors.verticalCenter: parent.verticalCenter
-
-                Repeater {
-                    model: [
-                        { id: "upload", stepNum: "1", label: "Модель & Цель" },
-                        { id: "analyze", stepNum: "2", label: "ИИ-Анализ" },
-                        { id: "recommend", stepNum: "3", label: "Профиль & Чат" },
-                        { id: "apply", stepNum: "4", label: "Применение" },
-                        { id: "done", stepNum: "5", label: "Результат" }
-                    ]
-
-                    delegate: Row {
-                        spacing: 6
-                        anchors.verticalCenter: parent.verticalCenter
-
-                        Rectangle {
-                            height: 28
-                            radius: 14
-                            color: root.phase === modelData.id ? root.primarySoft : (
-                                (modelData.id === "upload" && root.phase !== "upload") ||
-                                (modelData.id === "analyze" && (root.phase === "recommend" || root.phase === "apply" || root.phase === "done")) ||
-                                (modelData.id === "recommend" && (root.phase === "apply" || root.phase === "done")) ||
-                                (modelData.id === "apply" && root.phase === "done") ? root.successSoft : "#f8fafc"
-                            )
-                            border.color: root.phase === modelData.id ? root.primary : (
-                                (modelData.id === "upload" && root.phase !== "upload") ||
-                                (modelData.id === "analyze" && (root.phase === "recommend" || root.phase === "apply" || root.phase === "done")) ||
-                                (modelData.id === "recommend" && (root.phase === "apply" || root.phase === "done")) ||
-                                (modelData.id === "apply" && root.phase === "done") ? root.successBorder : root.border
-                            )
-                            border.width: 1
-                            implicitWidth: stepPillRow.width + 16
-
-                            Row {
-                                id: stepPillRow
-                                anchors.centerIn: parent
-                                spacing: 6
-
-                                Text {
-                                    text: (modelData.id === "upload" && root.phase !== "upload") ||
-                                          (modelData.id === "analyze" && (root.phase === "recommend" || root.phase === "apply" || root.phase === "done")) ||
-                                          (modelData.id === "recommend" && (root.phase === "apply" || root.phase === "done")) ||
-                                          (modelData.id === "apply" && root.phase === "done") ? "✓" : modelData.stepNum
-                                    color: root.phase === modelData.id ? root.primary : (
-                                        (modelData.id === "upload" && root.phase !== "upload") ||
-                                        (modelData.id === "analyze" && (root.phase === "recommend" || root.phase === "apply" || root.phase === "done")) ||
-                                        (modelData.id === "recommend" && (root.phase === "apply" || root.phase === "done")) ||
-                                        (modelData.id === "apply" && root.phase === "done") ? root.success : root.muted
-                                    )
-                                    font.pixelSize: 11
-                                    font.bold: true
-                                }
-
-                                Text {
-                                    text: modelData.label
-                                    color: root.phase === modelData.id ? root.primary : root.ink
-                                    font.pixelSize: 11
-                                    font.bold: root.phase === modelData.id
-                                }
-                            }
-
-                            MouseArea {
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                cursorShape: (modelData.id === "upload" && root.phase !== "upload") || (modelData.id === "recommend" && root.phase === "done") ? Qt.PointingHandCursor : Qt.ArrowCursor
-                                onClicked: {
-                                    if (modelData.id === "upload" && !(activeCtrl && activeCtrl.busy)) {
-                                        root.phase = "upload";
-                                    } else if (modelData.id === "recommend" && root.phase === "done") {
-                                        root.phase = "recommend";
-                                    }
-                                }
-                            }
-                        }
-
-                        Text {
-                            visible: index < 4
-                            text: "›"
-                            color: root.muted
-                            font.pixelSize: 14
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                }
-            }
-
             Item { Layout.fillWidth: true }
 
-            // Slicer Status Indicator Pill
             Rectangle {
-                height: 28
-                radius: 14
-                color: activeCtrl && activeCtrl.connected ? "#ecfdf5" : "#fffbeb"
-                border.color: activeCtrl && activeCtrl.connected ? "#a7f3d0" : "#fde68a"
-                border.width: 1
-                implicitWidth: statusText.width + 26
-
-                Row {
-                    anchors.centerIn: parent
-                    spacing: 6
-                    Rectangle {
-                        width: 7
-                        height: 7
-                        radius: 4
-                        color: activeCtrl && activeCtrl.connected ? root.success : root.warning
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                    Text {
-                        id: statusText
-                        text: activeCtrl && activeCtrl.connected ? "STE Slicer" : "Подключение…"
-                        color: activeCtrl && activeCtrl.connected ? "#065f46" : "#92400e"
-                        font.pixelSize: 11
-                        font.bold: true
-                    }
-                }
-            }
-
-            // MCP Log Drawer Toggle Button
-            Rectangle {
+                width: 32
                 height: 32
                 radius: 8
-                color: logBtnMouse.containsMouse ? "#eff6ff" : "#f8fafc"
-                border.color: logBtnMouse.containsMouse ? "#2563eb" : root.border
+                color: logHeaderMouse.containsMouse ? "#eff6ff" : "#f8fafc"
+                border.color: root.border
                 border.width: 1
-                implicitWidth: logBtnRow.width + 16
-
-                Row {
-                    id: logBtnRow
-                    anchors.centerIn: parent
-                    spacing: 6
-                    Text { text: "📋"; font.pixelSize: 12 }
-                    Text {
-                        text: "Журнал MCP"
-                        color: logBtnMouse.containsMouse ? root.primary : root.ink
-                        font.pixelSize: 11
-                        font.bold: true
-                    }
-                }
-
+                Layout.alignment: Qt.AlignVCenter
+                z: 2
+                Text { anchors.centerIn: parent; text: "📋"; font.pixelSize: 14 }
                 MouseArea {
-                    id: logBtnMouse
+                    id: logHeaderMouse
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
@@ -538,60 +460,15 @@ Window {
     }
 
     // =================================================================
-    // 2. CONTEXT SUB-BAR (PRINTER & SCENE TELEMETRY)
+    // 2. MAIN WORKFLOW BODY CONTAINER
     // =================================================================
-    Rectangle {
-        id: contextBar
-        anchors.top: header.bottom
-        width: parent.width
-        height: 38
-        color: "#f1f5f9"
-        border.color: root.border
-        border.width: 1
-        z: 9
-
-        Row {
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.left: parent.left
-            anchors.leftMargin: 24
-            spacing: 24
-
-            Row {
-                spacing: 6
-                anchors.verticalCenter: parent.verticalCenter
-                Text { text: "🖨 Принтер:"; color: root.muted; font.pixelSize: 11 }
-                Text { text: activeCtrl ? activeCtrl.printerName : "Stereotech Hybrid 530"; color: root.ink; font.pixelSize: 11; font.bold: true }
-            }
-
-            Row {
-                spacing: 6
-                anchors.verticalCenter: parent.verticalCenter
-                Text { text: "⚡ Кинематика:"; color: root.muted; font.pixelSize: 11 }
-                Text { text: (activeCtrl ? activeCtrl.printMode : "3D") + " (Stereotech 5-Axis ready)"; color: root.primary; font.pixelSize: 11; font.bold: true }
-            }
-
-            Row {
-                spacing: 6
-                anchors.verticalCenter: parent.verticalCenter
-                Text { text: "🧵 Материал:"; color: root.muted; font.pixelSize: 11 }
-                Text { text: activeCtrl ? activeCtrl.material : "Не выбран"; color: root.ink; font.pixelSize: 11; font.bold: true }
-            }
-
-            Row {
-                spacing: 6
-                anchors.verticalCenter: parent.verticalCenter
-                Text { text: "🧊 Моделей на столе:"; color: root.muted; font.pixelSize: 11 }
-                Text { text: "" + fileCount(); color: fileCount() > 0 ? root.success : root.muted; font.pixelSize: 11; font.bold: true }
-            }
-        }
-    }
 
     // =================================================================
     // 3. MAIN WORKFLOW BODY CONTAINER
     // =================================================================
     Item {
         id: body
-        anchors.top: contextBar.bottom
+        anchors.top: header.bottom
         anchors.bottom: parent.bottom
         width: parent.width
 
@@ -715,6 +592,7 @@ Window {
                                             for (var i = 0; i < drop.urls.length; i++) {
                                                 activeCtrl.addAttachment(drop.urls[i].toString());
                                             }
+                                            root.modelCountVal = activeCtrl.modelCount;
                                         }
                                     }
                                 }
@@ -1405,7 +1283,7 @@ Window {
 
                     // COL 3: INTERACTIVE AI CO-PILOT CHAT
                     Rectangle {
-                        width: parent.width * 0.72 - 24
+                        width: parent.width * 0.30 - 24
                         height: parent.height
                         radius: 10
                         color: "#ffffff"
@@ -1472,7 +1350,7 @@ Window {
 
                                 delegate: Rectangle {
                                     width: changeList.width
-                                    height: msgText.implicitHeight + 16
+                                    height: msgText.implicitHeight + 20
                                     radius: 8
                                     color: model.role === "user" ? root.primarySoft : "#f8fafc"
                                     border.color: model.role === "user" ? root.primaryBorder : root.border
@@ -1481,11 +1359,13 @@ Window {
                                     Text {
                                         id: msgText
                                         anchors.fill: parent
-                                        anchors.margins: 8
-                                        text: model.text
-                                        textFormat: Text.RichText
+                                        anchors.margins: 10
+                                        text: model.role === "assistant" && activeCtrl
+                                              ? activeCtrl.renderMarkdown(model.text)
+                                              : model.text
+                                        textFormat: model.role === "assistant" ? Text.RichText : Text.PlainText
                                         color: root.ink
-                                        font.pixelSize: 10
+                                        font.pixelSize: 14
                                         wrapMode: Text.Wrap
                                     }
                                 }
@@ -1574,6 +1454,35 @@ Window {
                         }
                     }
 
+                    Rectangle {
+                        height: 28
+                        radius: 7
+                        color: logBarMouse.containsMouse ? "#eff6ff" : "#f8fafc"
+                        border.color: logBarMouse.containsMouse ? root.primaryBorder : root.border
+                        border.width: 1
+                        implicitWidth: logButtonLabel.width + 22
+                        Layout.alignment: Qt.AlignVCenter
+                        Row {
+                            anchors.centerIn: parent
+                            spacing: 5
+                            Text { text: "📋"; font.pixelSize: 12 }
+                            Text {
+                                id: logButtonLabel
+                                text: "Журнал MCP"
+                                color: logBarMouse.containsMouse ? root.primary : root.ink
+                                font.pixelSize: 10
+                                font.bold: true
+                            }
+                        }
+                        MouseArea {
+                            id: logBarMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: logDrawer.opened = !logDrawer.opened
+                        }
+                    }
+
                     Item { Layout.fillWidth: true }
 
                     Rectangle {
@@ -1606,23 +1515,60 @@ Window {
                     Rectangle {
                         height: 38
                         radius: 8
-                        color: !(activeCtrl && activeCtrl.busy) ? (sliceBtnMouse.containsMouse ? "#047857" : "#059669") : "#cbd5e1"
-                        implicitWidth: sliceBtnText.width + 30
+                        color: !(activeCtrl && activeCtrl.busy) ? (exportBtnMouse.containsMouse ? "#047857" : "#059669") : "#cbd5e1"
+                        implicitWidth: exportBtnText.width + 30
 
-                        Text {
-                            id: sliceBtnText
+                        Row {
+                            id: exportBtnText
                             anchors.centerIn: parent
-                            text: "Создать G-code"
-                            color: "#ffffff"
-                            font.pixelSize: 12
-                            font.bold: true
+                            spacing: 6
+                            Text {
+                                text: "📦"
+                                font.pixelSize: 13
+                            }
+                            Text {
+                                text: "Экспорт (3MF и G-код)"
+                                color: "#ffffff"
+                                font.pixelSize: 12
+                                font.bold: true
+                            }
                         }
                         MouseArea {
-                            id: sliceBtnMouse
+                            id: exportBtnMouse
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: !(activeCtrl && activeCtrl.busy) ? Qt.PointingHandCursor : Qt.ArrowCursor
-                            onClicked: { if (activeCtrl) activeCtrl.generateGcode("model_submission"); }
+                            onClicked: { exportFolderDialog.open(); }
+                        }
+                    }
+
+                    Rectangle {
+                        visible: activeCtrl && activeCtrl.exportedDirectory ? true : false
+                        height: 38
+                        radius: 8
+                        color: openFolderMouse.containsMouse ? "#f1f5f9" : "#ffffff"
+                        border.color: "#cbd5e1"
+                        border.width: 1
+                        implicitWidth: openFolderText.width + 24
+
+                        Row {
+                            id: openFolderText
+                            anchors.centerIn: parent
+                            spacing: 6
+                            Text { text: "📁"; font.pixelSize: 12 }
+                            Text {
+                                text: "Открыть папку"
+                                color: root.ink
+                                font.pixelSize: 11
+                                font.bold: true
+                            }
+                        }
+                        MouseArea {
+                            id: openFolderMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: { if (activeCtrl) activeCtrl.openFolder(activeCtrl.exportedDirectory); }
                         }
                     }
                 }
@@ -1878,11 +1824,11 @@ Window {
                             Rectangle {
                                 height: 34
                                 radius: 6
-                                color: exportBtnMouse.containsMouse ? "#1d4ed8" : "#2563eb"
-                                implicitWidth: exportBtnText.width + 24
+                                color: exportAllBtnMouse.containsMouse ? "#1d4ed8" : "#2563eb"
+                                implicitWidth: exportAllBtnText.width + 24
 
                                 Row {
-                                    id: exportBtnText
+                                    id: exportAllBtnText
                                     anchors.centerIn: parent
                                     spacing: 6
                                     Text { text: "🚀"; font.pixelSize: 12 }
@@ -1895,12 +1841,12 @@ Window {
                                 }
 
                                 MouseArea {
-                                    id: exportBtnMouse
+                                    id: exportAllBtnMouse
                                     anchors.fill: parent
                                     hoverEnabled: true
                                     cursorShape: Qt.PointingHandCursor
                                     onClicked: {
-                                        if (activeCtrl) activeCtrl.exportResult("model_submission");
+                                        exportFolderDialog.open();
                                     }
                                 }
                             }
@@ -2114,7 +2060,7 @@ Window {
     AgentLogDrawer {
         id: logDrawer
         anchors.right: parent.right
-        anchors.top: contextBar.bottom
+        anchors.top: header.bottom
         anchors.bottom: parent.bottom
         width: Math.min(480, root.width * 0.44)
         controller: root.activeCtrl

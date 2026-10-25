@@ -107,7 +107,7 @@ class SceneTransformTool(BaseMCPTool):
         "properties": {
             "node_id": {
                 "type": "string",
-                "description": "Identifier or name of the SceneNode on the scene."
+                "description": "Optional identifier or name of the SceneNode on the scene. Leave empty or omit to automatically transform the current model on the build plate."
             },
             "file_path": {
                 "type": "string",
@@ -182,6 +182,23 @@ class SceneTransformTool(BaseMCPTool):
         "skirt_line_count": int,
     }
 
+    _SETTING_ALIASES = {
+        "infill_density": "infill_sparse_density",
+        "infill": "infill_sparse_density",
+        "infill_percentage": "infill_sparse_density",
+        "print_temperature": "material_print_temperature",
+        "temperature": "material_print_temperature",
+        "nozzle_temperature": "material_print_temperature",
+        "bed_temperature": "material_bed_temperature",
+        "fan_speed": "cool_fan_speed",
+        "fan": "cool_fan_speed",
+        "supports": "support_enable",
+        "support": "support_enable",
+        "supports_enabled": "support_enable",
+        "speed": "speed_print",
+        "print_speed": "speed_print",
+    }
+
     def execute(self, **kwargs):
         # type: (**Any) -> Dict[str, Any]
         """Execute node transformations and write parameter overrides."""
@@ -210,6 +227,13 @@ class SceneTransformTool(BaseMCPTool):
                 warnings=warnings
             )
 
+            if isinstance(result, dict):
+                requested_work = bool(rotation_euler_deg is not None or position_xy_mm is not None or scale_factor is not None or print_parameters or supports_enabled is not None)
+                applied_work = bool(result.get("applied_overrides") or result.get("applied_rotation_euler_deg") is not None or result.get("applied_scale_factor") is not None or result.get("applied_position_xy_mm") is not None)
+                if result.get("warnings"):
+                    result["status"] = "PARTIAL_SUCCESS" if applied_work else "ERROR"
+                elif requested_work and not applied_work:
+                    result["status"] = "ERROR"
             return result
 
         except STEPluginError as exc:
@@ -319,7 +343,7 @@ class SceneTransformTool(BaseMCPTool):
             arranged = self._arrange_node(app, scene, node)
             if not arranged:
                 self._center_node_on_plate(node)
-                warnings.append("Module cura.Arranging.Arrange unavailable; centered on plate.")
+                warnings.append("Cura Arrange unavailable; centered target node on plate using fallback.")
             self._drop_node_to_build_plate(node)
 
         final_uranium_pos = node.getPosition()
@@ -335,6 +359,8 @@ class SceneTransformTool(BaseMCPTool):
         applied_overrides = {}
         if print_parameters:
             applied_overrides = self._apply_slicer_parameters(app, print_parameters, warnings)
+            if warnings:
+                warnings.append("Не все параметры могли быть подтверждены; проверьте applied_overrides и warnings.")
 
         resolved_id = str(getattr(node, "getId", lambda: getattr(node, "getName", lambda: "unknown"))())
         resolved_name = str(getattr(node, "getName", lambda: "Scene_Mesh")())
@@ -395,41 +421,151 @@ class SceneTransformTool(BaseMCPTool):
             pass
         return False
 
+    def _get_printable_candidates(self, scene):
+        """Collect printable top-level mesh nodes on the scene, ignoring build plate/hull/helpers."""
+        all_nodes = scene.getRoot().getAllChildren() if hasattr(scene.getRoot(), "getAllChildren") else []
+        candidates = []
+        for node in all_nodes:
+            if not (hasattr(node, "getMeshData") and node.getMeshData() is not None):
+                continue
+            # Ignore ConvexHullNode and helper meshes
+            if type(node).__name__ == "ConvexHullNode" or hasattr(node, "getHull"):
+                continue
+            if hasattr(node, "callDecoration"):
+                try:
+                    if node.callDecoration("isNonPrintingMesh"):
+                        continue
+                except Exception:
+                    pass
+
+            # Ignore child mesh if parent is already a mesh
+            parent = getattr(node, "getParent", lambda: None)()
+            if parent is not None and getattr(parent, "getMeshData", lambda: None)() is not None:
+                continue
+
+            candidates.append(node)
+
+        # 1. Prefer sliceable nodes (Cura decorator isSliceable)
+        sliceable = [n for n in candidates if hasattr(n, "callDecoration") and n.callDecoration("isSliceable")]
+        if sliceable:
+            return sliceable
+
+        # 2. Prefer named nodes (ignoring empty or unnamed nodes like build plates)
+        named = [
+            n for n in candidates
+            if getattr(n, "getName", lambda: "")() and getattr(n, "getName", lambda: "")() not in ("", "Unnamed_Mesh")
+        ]
+        if named:
+            return named
+
+        return candidates
+
+    def _get_selected_mesh_node(self, scene):
+        """Check if any mesh node is currently selected in Cura/Uranium."""
+        try:
+            from UM.Scene.Selection import Selection
+            selected_objects = Selection.getAllSelectedObjects()
+            for obj in (selected_objects or []):
+                if hasattr(obj, "getMeshData") and obj.getMeshData() is not None:
+                    return obj
+                for child in getattr(obj, "getAllChildren", lambda: [])():
+                    if hasattr(child, "getMeshData") and child.getMeshData() is not None:
+                        return child
+        except Exception:
+            pass
+        return None
+
     def _resolve_node(self, app, scene, file_path, node_id):
         """Retrieve SceneNode by identifier or import from file."""
-        if node_id:
-            found = self._find_node_by_id(scene.getRoot(), str(node_id))
+        placeholders = {
+            "model", "current_model", "current", "active", "default",
+            "selected", "scene", "none", "null", "part", "object", ""
+        }
+        clean_node_id = str(node_id).strip() if node_id is not None else None
+        if clean_node_id and clean_node_id.lower() in placeholders:
+            clean_node_id = None
+
+        candidates = self._get_printable_candidates(scene)
+
+        if clean_node_id:
+            found = self._find_node_by_id(scene.getRoot(), clean_node_id)
             if found:
                 return found
 
-        if file_path:
-            if not os.path.exists(file_path):
-                raise MeshError("File not found: {}".format(file_path))
-            handler = app.getMeshFileHandler()
-            reader = getattr(handler, "read", None) if handler is not None else None
-            if reader is not None:
-                loaded = reader(file_path)
-                if loaded:
-                    if isinstance(loaded, list) and len(loaded) > 0:
-                        return loaded[0]
-                    return loaded
-            children = [c for c in scene.getRoot().getAllChildren() if hasattr(c, "getMeshData") and c.getMeshData()]
-            if children:
-                return children[-1]
+            # Search among printable candidates by partial match on name or ID
+            target_str = clean_node_id.lower()
+            for cand in candidates:
+                cand_name = str(getattr(cand, "getName", lambda: "")()).lower()
+                cand_id = str(getattr(cand, "getId", lambda: "")()).lower()
+                if target_str in cand_name or target_str in cand_id or os.path.splitext(target_str)[0] in cand_name:
+                    return cand
 
-        for child in scene.getRoot().getAllChildren():
-            if hasattr(child, "getMeshData") and child.getMeshData():
-                return child
+            if len(candidates) == 1:
+                return candidates[0]
+            selected = self._get_selected_mesh_node(scene)
+            if selected:
+                return selected
+            raise SceneError("Scene node was not found.", details={"node_id": node_id, "available_candidates": [str(getattr(n, "getName", lambda: "")()) for n in candidates]})
+
+        if file_path:
+            clean_file_path = str(file_path).strip()
+            if clean_file_path:
+                base_name = os.path.basename(clean_file_path).lower()
+                base_stem = os.path.splitext(base_name)[0]
+                for cand in candidates:
+                    cand_name = str(getattr(cand, "getName", lambda: "")()).lower()
+                    if cand_name == base_name or os.path.splitext(cand_name)[0] == base_stem:
+                        return cand
+
+                if not os.path.exists(clean_file_path):
+                    raise MeshError("File not found: {}".format(clean_file_path))
+                handler = app.getMeshFileHandler()
+                reader = getattr(handler, "read", None) if handler is not None else None
+                if reader is not None:
+                    loaded = reader(clean_file_path)
+                    if loaded:
+                        if isinstance(loaded, list) and len(loaded) > 0:
+                            return loaded[0]
+                        return loaded
+
+                new_candidates = self._get_printable_candidates(scene)
+                if len(new_candidates) == 1:
+                    return new_candidates[0]
+                for cand in new_candidates:
+                    cand_name = str(getattr(cand, "getName", lambda: "")()).lower()
+                    if cand_name == base_name or os.path.splitext(cand_name)[0] == base_stem:
+                        return cand
+                if new_candidates:
+                    return new_candidates[-1]
+
+        selected = self._get_selected_mesh_node(scene)
+        if selected:
+            if not hasattr(selected, "callDecoration") or selected.callDecoration("isSliceable") or getattr(selected, "getName", lambda: "")():
+                return selected
+
+        if candidates:
+            return candidates[0]
         return None
 
     def _find_node_by_id(self, parent_node, target_id):
         """Recursively locate node by ID or name."""
-        if str(getattr(parent_node, "getId", lambda: "")()) == target_id:
+        if not target_id:
+            return None
+        target_str = str(target_id).strip()
+        target_lower = target_str.lower()
+        target_base = os.path.splitext(target_lower)[0]
+
+        node_id_str = str(getattr(parent_node, "getId", lambda: "")())
+        node_name_str = str(getattr(parent_node, "getName", lambda: "")())
+        node_name_lower = node_name_str.lower()
+        node_name_base = os.path.splitext(node_name_lower)[0]
+
+        if node_id_str == target_str or node_name_str == target_str:
             return parent_node
-        if str(getattr(parent_node, "getName", lambda: "")()) == target_id:
+        if node_name_lower == target_lower or node_name_base == target_base:
             return parent_node
 
-        for child in parent_node.getAllChildren():
+        for child in getattr(parent_node, "getChildren", lambda: parent_node.getAllChildren())():
             res = self._find_node_by_id(child, target_id)
             if res:
                 return res
@@ -470,9 +606,10 @@ class SceneTransformTool(BaseMCPTool):
             "layer_height"
         }
 
-        for key, raw_value in print_parameters.items():
+        for raw_key, raw_value in print_parameters.items():
+            key = self._SETTING_ALIASES.get(raw_key, raw_key)
             if key not in self._SETTING_TYPES:
-                warnings.append("Parameter '{}' not in supported whitelist; skipped.".format(key))
+                warnings.append("Parameter '{}' not in supported whitelist; skipped.".format(raw_key))
                 continue
 
             expected_type = self._SETTING_TYPES[key]
@@ -485,11 +622,14 @@ class SceneTransformTool(BaseMCPTool):
                 elif expected_type is int:
                     typed_value = int(round(float(raw_value)))
                 elif expected_type is float:
-                    typed_value = float(raw_value)
+                    val = float(raw_value)
+                    if key == "infill_sparse_density" and 0.0 < val <= 1.0:
+                        val *= 100.0
+                    typed_value = val
                 else:
                     typed_value = str(raw_value)
             except (ValueError, TypeError) as cast_err:
-                warnings.append("Type cast failure for '{}': {}. Skipped.".format(key, cast_err))
+                warnings.append("Type cast failure for '{}': {}. Skipped.".format(raw_key, cast_err))
                 continue
 
             is_per_extruder = False
@@ -527,6 +667,9 @@ class SceneTransformTool(BaseMCPTool):
                 verified_new_val = target_stack.getProperty(key, "value")
             except Exception:
                 verified_new_val = typed_value
+            if not self._values_equal(verified_new_val, typed_value):
+                warnings.append("Verification failed for {}.{}: expected {}, got {}".format(stack_name, key, typed_value, verified_new_val))
+                continue
 
             applied_report[key] = {
                 "old": self._serialize_value(old_val),
@@ -558,6 +701,15 @@ class SceneTransformTool(BaseMCPTool):
             return stack.getTop()
 
         return None
+
+    @staticmethod
+    def _values_equal(actual, expected):
+        if isinstance(expected, float):
+            try:
+                return abs(float(actual) - expected) <= 1e-6
+            except (TypeError, ValueError):
+                return False
+        return actual == expected or str(actual) == str(expected)
 
     @staticmethod
     def _serialize_value(val):

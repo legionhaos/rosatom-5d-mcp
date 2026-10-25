@@ -124,9 +124,10 @@ class ConversationContextManager(object):
     and Base64-encoded images), and collects active STE Slicer state snapshots.
     """
 
-    def __init__(self):
-        # type: () -> None
+    def __init__(self, application=None):
+        # type: (Optional[Any]) -> None
         """Initializes empty message history and attached models tracking."""
+        self._application_override = application
         self.messages = []  # type: List[Dict[str, Any]]
         self.attached_models = []  # type: List[str]
         self._mock_snapshot = None  # type: Optional[Dict[str, Any]]
@@ -317,26 +318,50 @@ class ConversationContextManager(object):
         # If MainThreadDispatcher is available, execute on the main thread
         if MainThreadDispatcher is not None:
             try:
-                return MainThreadDispatcher.call_on_main_thread(self._query_cura_state)
+                return MainThreadDispatcher.call_on_main_thread(
+                    self._query_cura_state, self._application_override
+                )
             except Exception as e:
-                logger.debug("MainThreadDispatcher execution failed: %s. Using direct query.", e)
+                logger.warning("Main-thread scene snapshot failed: %s", e)
+                return self._build_fallback_snapshot()
 
-        return self._query_cura_state()
+        return self._query_cura_state(self._application_override)
 
-    def _query_cura_state(self):
-        # type: () -> Dict[str, Any]
+    def _query_cura_state(self, app=None):
+        # type: (Optional[Any]) -> Dict[str, Any]
         """Internal method querying live CuraApplication instance."""
-        app = None
-        try:
-            from cura.CuraApplication import CuraApplication
-            app = CuraApplication.getInstance()
-        except Exception:
-            try:
-                import sys
-                if "cura.CuraApplication" in sys.modules:
-                    app = sys.modules["cura.CuraApplication"].CuraApplication.getInstance()
-            except Exception:
-                app = None
+        if app is None:
+            for mod_name in ("steslicer.SteSlicerApplication", "UM.Application", "cura.CuraApplication"):
+                try:
+                    mod = __import__(mod_name, fromlist=["SteSlicerApplication", "Application", "CuraApplication"])
+                    for attr in ("SteSlicerApplication", "Application", "CuraApplication"):
+                        cls_ = getattr(mod, attr, None)
+                        if cls_ and hasattr(cls_, "getInstance"):
+                            inst = cls_.getInstance()
+                            if inst:
+                                app = inst
+                                break
+                    if app:
+                        break
+                except Exception:
+                    pass
+            if app is None:
+                try:
+                    import sys
+                    for mod_name in ("steslicer.SteSlicerApplication", "UM.Application", "cura.CuraApplication"):
+                        if mod_name in sys.modules:
+                            mod = sys.modules[mod_name]
+                            for attr in ("SteSlicerApplication", "Application", "CuraApplication"):
+                                cls_ = getattr(mod, attr, None)
+                                if cls_ and hasattr(cls_, "getInstance"):
+                                    inst = cls_.getInstance()
+                                    if inst:
+                                        app = inst
+                                        break
+                        if app:
+                            break
+                except Exception:
+                    app = None
 
         # If live CuraApplication is not available (e.g. in tests/headless), return mock or fallback
         if app is None:
@@ -344,45 +369,88 @@ class ConversationContextManager(object):
                 return dict(self._mock_snapshot)
             return self._build_fallback_snapshot()
 
-        # Query live scene models
+        # Query live scene models. Cura nodes may be nested under group nodes,
+        # so include descendants rather than only the root's immediate children.
         models = []  # type: List[Dict[str, Any]]
         try:
             scene = app.getController().getScene()
             root = scene.getRoot()
-            for child in root.getChildren():
-                if hasattr(child, "getMeshData") and child.getMeshData() is not None:
-                    node_name = child.getName() if hasattr(child, "getName") else "Unnamed_Mesh"
+            children = []
+            pending = list(root.getChildren() if hasattr(root, 'getChildren') else [])
+            seen = set()
+            while pending:
+                node = pending.pop(0)
+                node_key = id(node)
+                if node_key in seen:
+                    continue
+                seen.add(node_key)
+                children.append(node)
+                pending.extend(getattr(node, 'getChildren', lambda: [])() or [])
+            if not children and hasattr(root, 'getAllChildren'):
+                children = root.getAllChildren() or []
+            for child in children:
+                try:
+                    mesh_getter = getattr(child, "getMeshData", None)
+                    if not callable(mesh_getter) or mesh_getter() is None:
+                        continue
+
+                    # Ignore convex hull preview nodes and helper meshes
+                    if type(child).__name__ == "ConvexHullNode" or hasattr(child, "getHull"):
+                        continue
+
+                    # Skip explicitly non-printing meshes and nested mesh components;
+                    # valid models can have no name or lack Cura's isSliceable decoration.
+                    if hasattr(child, "callDecoration"):
+                        try:
+                            if child.callDecoration("isNonPrintingMesh"):
+                                continue
+                        except Exception:
+                            pass
+                    parent = getattr(child, "getParent", lambda: None)()
+                    parent_mesh_getter = getattr(parent, "getMeshData", None) if parent is not None else None
+                    if callable(parent_mesh_getter) and parent_mesh_getter() is not None:
+                        continue
+
+                    try:
+                        node_name = child.getName() if hasattr(child, "getName") else ""
+                    except Exception:
+                        node_name = ""
+
                     node_id = str(child.getId()) if hasattr(child, "getId") else "node"
 
-                    # Position
+                    # Position: in 3D printing convention: X=x, Y=z (depth), Z=y (height)
                     pos = [0.0, 0.0, 0.0]
                     if hasattr(child, "getPosition"):
                         p = child.getPosition()
-                        pos = [round(float(p.x()), 2), round(float(p.y()), 2), round(float(p.z()), 2)]
+                        px = float(p.x() if callable(getattr(p, "x", None)) else getattr(p, "x", 0.0))
+                        py = float(p.z() if callable(getattr(p, "z", None)) else getattr(p, "z", 0.0))
+                        pz = float(p.y() if callable(getattr(p, "y", None)) else getattr(p, "y", 0.0))
+                        pos = [round(px, 2), round(py, 2), round(pz, 2)]
 
                     # Rotation
                     rot = [0.0, 0.0, 0.0]
                     if hasattr(child, "getOrientation"):
                         rot = list(self._quaternion_to_euler_degrees(child.getOrientation()))
 
-                    # Dimensions
+                    # Dimensions: in 3D printing convention: X=width, Y=depth, Z=height
                     dims = [0.0, 0.0, 0.0]
                     if hasattr(child, "getBoundingBox"):
                         bbox = child.getBoundingBox()
                         if bbox:
-                            dims = [
-                                round(float(bbox.width()), 2),
-                                round(float(bbox.depth()), 2),
-                                round(float(bbox.height()), 2)
-                            ]
+                            w = float(bbox.width() if callable(getattr(bbox, "width", None)) else getattr(bbox, "width", 0.0))
+                            d = float(bbox.depth() if callable(getattr(bbox, "depth", None)) else getattr(bbox, "depth", 0.0))
+                            h = float(bbox.height() if callable(getattr(bbox, "height", None)) else getattr(bbox, "height", 0.0))
+                            dims = [round(w, 2), round(d, 2), round(h, 2)]
 
                     models.append({
                         "id": node_id,
-                        "name": node_name,
+                        "name": node_name or "Model",
                         "dimensions_mm": dims,
                         "position": pos,
                         "rotation_deg": rot
                     })
+                except Exception as child_err:
+                    logger.debug("Failed to inspect scene child node: %s", child_err)
         except Exception as e:
             logger.debug("Failed to query live Cura scene: %s", e)
 
@@ -401,23 +469,155 @@ class ConversationContextManager(object):
 
         try:
             registry = app.getContainerRegistry() if hasattr(app, "getContainerRegistry") else None
+            if registry is None:
+                try:
+                    from UM.Settings.ContainerRegistry import ContainerRegistry
+                    registry = ContainerRegistry.getInstance()
+                except Exception:
+                    pass
+
+            unique = {}
             if registry is not None:
-                finder = getattr(registry, "findContainers", None) or getattr(registry, "findInstanceContainers", None)
-                if finder is not None:
-                    containers = finder(type="material") or []
-                    available_materials = [str(c.getName()) for c in containers if hasattr(c, "getName")]
-            stack = app.getGlobalContainerStack()
+                # 1. Parse materials from registry
+                for finder_name in ("findInstanceContainersMetadata", "findContainersMetadata"):
+                    finder = getattr(registry, finder_name, None)
+                    if finder:
+                        try:
+                            found_md = finder(type="material") or []
+                            for md in found_md:
+                                if isinstance(md, dict) and md.get("name"):
+                                    name = str(md.get("name") or "")
+                                    cid = str(md.get("id") or "")
+                                    mat_type = str(md.get("material") or "")
+                                    if name and not name.lower().startswith("empty") and not cid.lower().startswith("empty"):
+                                        unique[cid or name] = {
+                                            "name": name,
+                                            "id": cid,
+                                            "material": mat_type
+                                        }
+                        except Exception:
+                            pass
+
+                for finder_name in ("findInstanceContainers", "findContainers"):
+                    finder = getattr(registry, finder_name, None)
+                    if finder:
+                        try:
+                            found = finder(type="material") or []
+                            for cont in found:
+                                name = str(getattr(cont, "getName", lambda: "")() or "")
+                                cid = str(getattr(cont, "getId", lambda: "")() or "")
+                                mat_type = str(getattr(cont, "getMetaDataEntry", lambda k, d="": "")("material", "") or "")
+                                if name and not name.lower().startswith("empty") and (cid or name) not in unique:
+                                    unique[cid or name] = {"name": name, "id": cid, "material": mat_type}
+                        except Exception:
+                            pass
+
+                # 2. Parse quality profiles from registry
+                for finder_name in ("findInstanceContainersMetadata", "findContainersMetadata"):
+                    finder = getattr(registry, finder_name, None)
+                    if finder:
+                        try:
+                            found_md = finder(type="quality") or []
+                            for md in found_md:
+                                if isinstance(md, dict) and md.get("name"):
+                                    pname = str(md.get("name") or "")
+                                    pid = str(md.get("id") or "")
+                                    if pname and not pname.lower().startswith("empty"):
+                                        if not any(p.get("id") == pid for p in available_profiles):
+                                            available_profiles.append({"name": pname, "id": pid})
+                        except Exception:
+                            pass
+
+            manager_getter = getattr(app, "getMaterialManager", None)
+            if manager_getter:
+                try:
+                    mgr = manager_getter()
+                    if mgr and hasattr(mgr, "_material_group_map"):
+                        for group in mgr._material_group_map.values():
+                            root = getattr(group, "root_material_node", None)
+                            cont = root.getContainer() if root and hasattr(root, "getContainer") else None
+                            if cont:
+                                name = str(getattr(cont, "getName", lambda: "")() or "")
+                                cid = str(getattr(cont, "getId", lambda: "")() or "")
+                                if name and not name.lower().startswith("empty") and (cid or name) not in unique:
+                                    unique[cid or name] = {"name": name, "id": cid}
+                except Exception:
+                    pass
+
+            if not unique:
+                fallback_defaults = [
+                    ("Generic CFF PA", "generic_cffpa", "CFF PA"),
+                    ("Generic PETG", "generic_petg_175", "PETG"),
+                    ("Generic PLA", "generic_pla_175", "PLA"),
+                    ("Generic ABS", "generic_abs_175", "ABS"),
+                    ("Generic TPU 95A", "generic_tpu_175", "TPU"),
+                    ("Generic Nylon", "generic_nylon_175", "Nylon"),
+                ]
+                for n, cid, m in fallback_defaults:
+                    unique[cid] = {"name": n, "id": cid, "material": m}
+
+            material_meta_map = {
+                "cff": {"temp_nozzle": 265, "temp_bed": 70, "fan": 0, "aliases": ["PA6-CF", "Carbon Nylon", "PA-CF", "CFF PA"]},
+                "petg": {"temp_nozzle": 235, "temp_bed": 75, "fan": 40, "aliases": ["PETG", "Generic PETG"]},
+                "pla": {"temp_nozzle": 205, "temp_bed": 60, "fan": 100, "aliases": ["PLA", "Generic PLA"]},
+                "abs": {"temp_nozzle": 240, "temp_bed": 100, "fan": 0, "aliases": ["ABS", "Generic ABS"]},
+                "tpu": {"temp_nozzle": 225, "temp_bed": 60, "fan": 20, "aliases": ["TPU", "Flex", "TPU 95A"]},
+                "nylon": {"temp_nozzle": 250, "temp_bed": 80, "fan": 0, "aliases": ["Nylon", "PA12", "PA6"]},
+                "pc": {"temp_nozzle": 280, "temp_bed": 110, "fan": 0, "aliases": ["PC", "Polycarbonate"]},
+                "asa": {"temp_nozzle": 250, "temp_bed": 100, "fan": 10, "aliases": ["ASA"]},
+            }
+            enriched = []
+            for item in unique.values():
+                mat_key = (str(item.get("material") or "") + " " + str(item.get("name") or "")).lower()
+                meta = None
+                for k, v in material_meta_map.items():
+                    if k in mat_key:
+                        meta = v
+                        break
+                entry = dict(item)
+                if meta:
+                    entry["recommended_temp_nozzle"] = meta["temp_nozzle"]
+                    entry["recommended_temp_bed"] = meta["temp_bed"]
+                    entry["recommended_fan"] = meta["fan"]
+                    entry["aliases"] = meta["aliases"]
+                enriched.append(entry)
+            available_materials = enriched
+
+            if not available_profiles:
+                available_profiles = [
+                    {"name": "Normal (0.2 mm)", "id": "normal"},
+                    {"name": "Fast (0.2 mm)", "id": "fast"},
+                    {"name": "Draft (0.3 mm)", "id": "draft"},
+                    {"name": "High (0.15 mm)", "id": "high"}
+                ]
+
+            stack = app.getGlobalContainerStack() if hasattr(app, "getGlobalContainerStack") else None
             if stack:
                 if hasattr(stack, "getName"):
                     printer_info["model"] = stack.getName()
 
                 if hasattr(stack, "material") and stack.material:
                     current_material = stack.material.getName()
+                if not current_material or current_material.lower() in ("empty_material", "empty", "none", ""):
+                    extruders = getattr(stack, "extruders", {})
+                    if isinstance(extruders, dict):
+                        for ext in extruders.values():
+                            if hasattr(ext, "material") and ext.material:
+                                mname = str(getattr(ext.material, "getName", lambda: "")() or "")
+                                if mname and not mname.lower().startswith("empty"):
+                                    current_material = mname
+                                    break
                 quality = getattr(stack, "quality", None)
                 if quality is not None and hasattr(quality, "getName"):
                     current_profile = str(quality.getName())
 
                 mode_val = stack.getProperty("ste_print_mode", "value")
+                if not mode_val or mode_val not in ("5D", "3D"):
+                    mode_val = stack.getProperty("printing_mode", "value")
+                    if mode_val == "classic":
+                        mode_val = "3D"
+                    elif mode_val in ("cylindrical_full", "spiral_5d", "5D"):
+                        mode_val = "5D"
                 if mode_val in ("5D", "3D"):
                     current_mode = mode_val
 
@@ -478,17 +678,28 @@ class ConversationContextManager(object):
 
         return {
             "printer": {
-                "model": "Stereotech 520 V2",
+                "model": "Stereotech 530 Hybrid",
                 "kinematics": "5D Multi-Axis (3 Linear + 2 Rotary C/B)",
                 "nozzle_diameter_mm": 0.4,
                 "max_build_volume_mm": [250, 250, 250]
             },
             "loaded_models": models,
-            "current_mode": "",
-            "current_material": "",
-            "current_profile": "",
-            "available_materials": [],
-            "available_profiles": [],
+            "current_mode": "3D",
+            "current_material": "Generic PETG",
+            "current_profile": "Standard",
+            "available_materials": [
+                {"name": "Generic CFF PA", "id": "generic_cffpa", "material": "CFF PA", "recommended_temp_nozzle": 265, "recommended_temp_bed": 70, "aliases": ["PA6-CF", "Carbon Nylon", "PA-CF", "CFF PA"]},
+                {"name": "Generic PETG", "id": "generic_petg_175", "material": "PETG", "recommended_temp_nozzle": 235, "recommended_temp_bed": 75, "aliases": ["PETG"]},
+                {"name": "Generic PLA", "id": "generic_pla_175", "material": "PLA", "recommended_temp_nozzle": 205, "recommended_temp_bed": 60, "aliases": ["PLA"]},
+                {"name": "Generic ABS", "id": "generic_abs_175", "material": "ABS", "recommended_temp_nozzle": 240, "recommended_temp_bed": 100, "aliases": ["ABS"]},
+                {"name": "Generic TPU 95A", "id": "generic_tpu_175", "material": "TPU", "recommended_temp_nozzle": 225, "recommended_temp_bed": 60, "aliases": ["TPU", "Flex"]},
+            ],
+            "available_profiles": [
+                {"name": "Normal (0.2 mm)", "id": "normal"},
+                {"name": "Fast (0.2 mm)", "id": "fast"},
+                {"name": "Draft (0.3 mm)", "id": "draft"},
+                {"name": "High (0.15 mm)", "id": "high"}
+            ],
             "key_parameters": {}
         }
 
@@ -497,11 +708,20 @@ class ConversationContextManager(object):
         # type: (Any) -> Tuple[float, float, float]
         """Converts a Quaternion object to Euler angles (rx, ry, rz) in degrees."""
         if hasattr(q, "toEulerAngles"):
-            angles = q.toEulerAngles()
-            return round(float(angles.x()), 2), round(float(angles.y()), 2), round(float(angles.z()), 2)
+            try:
+                angles = q.toEulerAngles()
+                ax = float(angles.x() if callable(getattr(angles, "x", None)) else getattr(angles, "x", 0.0))
+                ay = float(angles.y() if callable(getattr(angles, "y", None)) else getattr(angles, "y", 0.0))
+                az = float(angles.z() if callable(getattr(angles, "z", None)) else getattr(angles, "z", 0.0))
+                return round(ax, 2), round(ay, 2), round(az, 2)
+            except Exception:
+                pass
         if hasattr(q, "toEuler"):
-            angles = q.toEuler()
-            return round(float(angles[0]), 2), round(float(angles[1]), 2), round(float(angles[2]), 2)
+            try:
+                angles = q.toEuler()
+                return round(float(angles[0]), 2), round(float(angles[1]), 2), round(float(angles[2]), 2)
+            except Exception:
+                pass
 
         try:
             x = float(q.x() if callable(getattr(q, "x", None)) else getattr(q, "x", 0.0))

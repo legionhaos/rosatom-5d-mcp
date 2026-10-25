@@ -212,6 +212,9 @@ class ChatController(QObject):
 
     @pyqtProperty(int, notify=modelCountChanged)
     def modelCount(self):
+        live = max(self._attached_model_count(), self._scene_model_count())
+        if live != self._model_count:
+            self._model_count = live
         return self._model_count
 
     @pyqtProperty(str, notify=previewChanged)
@@ -515,21 +518,78 @@ class ChatController(QObject):
         if self._preview_timer is not None:
             self._preview_timer.start()
 
-    def _scene_nodes(self):
-        try:
-            from UM.Application import Application
-            from UM.Scene.Iterator.DepthFirstIterator import DepthFirstIterator
-            root = Application.getInstance().getController().getScene().getRoot()
-        except Exception:
-            return []
-        nodes = []
-        for node in DepthFirstIterator(root):
+    def _get_application_instance(self):
+        app = None
+        for mod_name in ("steslicer.SteSlicerApplication", "cura.CuraApplication", "UM.Application"):
             try:
-                if node.callDecoration("isSliceable") and node.getMeshData() is not None:
-                    nodes.append(node)
+                mod = __import__(mod_name, fromlist=["SteSlicerApplication", "CuraApplication", "Application"])
+                for attr in ("SteSlicerApplication", "CuraApplication", "Application"):
+                    cls_ = getattr(mod, attr, None)
+                    if cls_ and hasattr(cls_, "getInstance"):
+                        inst = cls_.getInstance()
+                        if inst:
+                            app = inst
+                            break
             except Exception:
                 pass
-        return nodes
+            if app is not None:
+                break
+        return app
+
+    def _scene_nodes(self):
+        try:
+            app = self._get_application_instance()
+            if app is None:
+                return []
+            controller = getattr(app, "getController", lambda: None)()
+            scene = controller.getScene() if controller else None
+            if scene is None:
+                return []
+            root = scene.getRoot()
+            if root is None:
+                return []
+
+            all_nodes = root.getAllChildren() if hasattr(root, "getAllChildren") else getattr(root, "getChildren", lambda: [])()
+
+            candidates = []
+            for node in all_nodes:
+                if not (hasattr(node, "getMeshData") and node.getMeshData() is not None):
+                    continue
+                if type(node).__name__ == "ConvexHullNode" or hasattr(node, "getHull"):
+                    continue
+                if hasattr(node, "callDecoration"):
+                    try:
+                        if node.callDecoration("isNonPrintingMesh"):
+                            continue
+                    except Exception:
+                        pass
+                parent = getattr(node, "getParent", lambda: None)()
+                if parent is not None and getattr(parent, "getMeshData", lambda: None)() is not None:
+                    continue
+                candidates.append(node)
+
+            def _is_sliceable(n):
+                if hasattr(n, "callDecoration") and n.callDecoration("isSliceable"):
+                    return True
+                p = getattr(n, "getParent", lambda: None)()
+                if p and hasattr(p, "callDecoration") and p.callDecoration("isSliceable"):
+                    return True
+                return False
+
+            sliceable = [n for n in candidates if _is_sliceable(n)]
+            if sliceable:
+                return sliceable
+
+            named = [
+                n for n in candidates
+                if getattr(n, "getName", lambda: "")() and getattr(n, "getName", lambda: "")() not in ("", "Unnamed_Mesh")
+            ]
+            if named:
+                return named
+
+            return candidates
+        except Exception:
+            return []
 
     def _describe_models(self, nodes):
         parts = []
@@ -770,6 +830,84 @@ class ChatController(QObject):
             self._set_busy(False)
 
     @pyqtSlot(str)
+    @pyqtSlot(str, str)
+    def exportResultToFolder(self, folder_path, model_name="model_submission"):
+        """Exports project.3mf and result.gcode directly to the specified folder.
+        If the scene has not been sliced yet, runs slicing first."""
+        if not folder_path:
+            return
+
+        clean_path = str(folder_path).strip()
+        if clean_path.startswith("file:///"):
+            clean_path = clean_path[8:]
+        elif clean_path.startswith("file://"):
+            clean_path = clean_path[7:]
+        if os.name == "nt" and len(clean_path) >= 3 and clean_path[0] == "/" and clean_path[2] == ":":
+            clean_path = clean_path[1:]
+        clean_path = os.path.normpath(clean_path)
+
+        if not os.path.exists(clean_path):
+            try:
+                os.makedirs(clean_path, exist_ok=True)
+            except Exception as e:
+                self._fail("Не удалось создать папку для экспорта: {0}".format(e))
+                return
+
+        model_name = (model_name or "model_submission").strip()
+        self.exportRequested.emit(model_name)
+        self._set_busy(True)
+
+        try:
+            from plugin.utils.artifact_exporter import ArtifactExporter
+            from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
+
+            # Check if G-code is already available in the scene
+            app = ArtifactExporter._get_application()
+            scene = app.getController().getScene() if app is not None and hasattr(app, "getController") else None
+            gcode_dict = getattr(scene, "gcode_dict", {}) if scene is not None else {}
+            has_gcode = bool(gcode_dict and any(gcode_dict.values()))
+
+            if not has_gcode:
+                self._messages.append_system("Подготовка G-кода: выполняется нарезка сцены...", self._now(), "pending")
+                self.messageAdded.emit()
+                slicer = getattr(self._agent, "_orchestrator", None) if self._agent is not None else None
+                mcp = getattr(slicer, "mcp_server", None)
+                if mcp is not None:
+                    res = mcp.call_tool("run_slicing_and_generate_gcode", {"timeout_sec": 180})
+                    if isinstance(res, dict) and str(res.get("status", "")).lower() in ("error", "failed"):
+                        err = res.get("message") or res.get("error") or "Ошибка слайсинга"
+                        self._messages.append_system("Предупреждение: {0}".format(err), self._now(), "warning")
+
+            chat_window = None
+            if self._slicer is not None and hasattr(self._slicer, "get_chat_window"):
+                chat_window = self._slicer.get_chat_window()
+            elif self._extension is not None and hasattr(self._extension, "_chat_view"):
+                chat_window = getattr(self._extension, "_chat_view", None)
+
+            exporter = ArtifactExporter(clean_path, dispatcher=MainThreadDispatcher)
+            report = exporter.export_all_for_model(model_name, chat_window=chat_window, validate=False, target_dir=clean_path)
+
+            export_dir = report.get("directory", clean_path)
+            self._last_gcode_path = report.get("result_gcode", os.path.join(export_dir, "result.gcode"))
+            self._exported_directory = export_dir
+            self._export_status = "Успешно экспортировано: " + os.path.basename(export_dir)
+            msg = "Файлы project.3mf и result.gcode успешно экспортированы в папку:
+{0}".format(export_dir)
+            self._messages.append_system(msg, self._now(), "ok")
+            self.exportFinished.emit(True, msg, export_dir)
+            self.recommendationChanged.emit()
+            self.messageAdded.emit()
+
+        except Exception as exc:
+            err = "Экспорт не выполнен: {0}".format(exc)
+            self._export_status = err
+            self._fail(err)
+            self.exportFinished.emit(False, err, "")
+            self.recommendationChanged.emit()
+        finally:
+            self._set_busy(False)
+
+    @pyqtSlot(str)
     def exportResult(self, model_name):
         model_name = (model_name or "model").strip()
         self.exportRequested.emit(model_name)
@@ -881,21 +1019,56 @@ class ChatController(QObject):
         self.toolFinished.emit(tool_name, status)
         self.messageAdded.emit()
 
+    @pyqtSlot(str, result=str)
+    def renderMarkdown(self, text):
+        return self._markdown_to_html(text)
+
     @staticmethod
     def _markdown_to_html(text):
         """Render safe, lightweight Markdown using Qt rich-text HTML."""
         import html
-        escaped = html.escape(str(text or ""), quote=False)
-        escaped = re.sub(r"```(?:[\w+-]+)?\s*([\s\S]*?)```", r"<pre>\1</pre>", escaped)
-        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-        escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
-        escaped = re.sub(r"(^|[^*])\*([^*\n]+)\*(?!\*)", r"\1<i>\2</i>", escaped)
-        escaped = re.sub(r"^### (.+)$", r"<h3>\1</h3>", escaped, flags=re.MULTILINE)
-        escaped = re.sub(r"^## (.+)$", r"<h2>\1</h2>", escaped, flags=re.MULTILINE)
-        escaped = re.sub(r"^# (.+)$", r"<h1>\1</h1>", escaped, flags=re.MULTILINE)
-        escaped = re.sub(r"^- (.+)$", r"• \1", escaped, flags=re.MULTILINE)
-        escaped = escaped.replace("\n", "<br/>")
-        return "<html><body>" + escaped + "</body></html>"
+
+        lines = str(text or "").splitlines()
+        rendered = []
+        index = 0
+
+        def inline(value):
+            value = html.escape(value, quote=False)
+            value = re.sub(r"`([^`]+)`", r"<code>\1</code>", value)
+            value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
+            return re.sub(r"(^|[^*])\*([^*\n]+)\*(?!\*)", r"\1<i>\2</i>", value)
+
+        while index < len(lines):
+            line = lines[index]
+            if "|" in line and index + 1 < len(lines) and re.match(
+                    r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", lines[index + 1]):
+                headers = [cell.strip() for cell in line.strip().strip("|").split("|")]
+                rendered.append('<table width="100%" cellspacing="0" cellpadding="4" style="border-collapse:collapse; table-layout:fixed;">')
+                rendered.append("<tr>" + "".join(
+                    '<th align="left" style="border:1px solid #cbd5e1;">{0}</th>'.format(inline(cell))
+                    for cell in headers
+                ) + "</tr>")
+                index += 2
+                while index < len(lines) and "|" in lines[index] and lines[index].strip():
+                    cells = [cell.strip() for cell in lines[index].strip().strip("|").split("|")]
+                    cells = (cells + [""] * len(headers))[:len(headers)]
+                    rendered.append("<tr>" + "".join(
+                        '<td style="border:1px solid #cbd5e1; word-wrap:break-word;">{0}</td>'.format(inline(cell))
+                        for cell in cells
+                    ) + "</tr>")
+                    index += 1
+                rendered.append("</table>")
+                continue
+
+            escaped = inline(line)
+            escaped = re.sub(r"^### (.+)$", r"<h3>\1</h3>", escaped)
+            escaped = re.sub(r"^## (.+)$", r"<h2>\1</h2>", escaped)
+            escaped = re.sub(r"^# (.+)$", r"<h1>\1</h1>", escaped)
+            escaped = re.sub(r"^- (.+)$", r"• \1", escaped)
+            rendered.append(escaped)
+            index += 1
+
+        return "<html><body><div style='width:100%; white-space:normal;'>" + "<br/>".join(rendered) + "</div></body></html>"
 
     def _update_parameters_from_dict(self, summary):
         if not summary or not isinstance(summary, dict):

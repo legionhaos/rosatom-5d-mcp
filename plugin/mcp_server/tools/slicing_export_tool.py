@@ -118,7 +118,14 @@ class SlicingTool(BaseMCPTool):
         # type: (**Any) -> Dict[str, Any]
         try:
             timeout_sec = float(kwargs.get("timeout_sec", 90.0))
+            if timeout_sec <= 0 or timeout_sec > 3600:
+                raise SlicingTimeoutError("timeout_sec должен быть в диапазоне (0, 3600].")
 
+            if self._event_listener is None or not hasattr(self._event_listener, "wait_for_slicing"):
+                raise SlicingFailedError(
+                    "Невозможно подтвердить завершение слайсинга: отсутствует event_listener.wait_for_slicing.",
+                    details={"completion_confirmed": False}
+                )
             if self._event_listener is not None and hasattr(self._event_listener, "reset"):
                 try:
                     self._event_listener.reset()
@@ -126,10 +133,7 @@ class SlicingTool(BaseMCPTool):
                     pass
 
             MainThreadDispatcher.run_sync(self._trigger_slice)
-
-            completed = True
-            if self._event_listener is not None and hasattr(self._event_listener, "wait_for_slicing"):
-                completed = self._event_listener.wait_for_slicing(timeout_sec=timeout_sec)
+            completed = self._event_listener.wait_for_slicing(timeout_sec=timeout_sec)
 
             if not completed:
                 raise SlicingTimeoutError(
@@ -138,10 +142,14 @@ class SlicingTool(BaseMCPTool):
                 )
 
             stats = MainThreadDispatcher.run_sync(self._collect_slice_stats)
+            gcode_available = MainThreadDispatcher.run_sync(self._has_gcode_for_active_build_plate)
+            if not gcode_available:
+                raise SlicingFailedError("Backend завершил слайсинг, но G-code в активной сцене не найден.")
 
             response = {
                 "status": "SUCCESS",
                 "slicing_result": "G-code generated",
+                "gcode_available": True,
             }
             response.update(stats)
             return response
@@ -178,6 +186,31 @@ class SlicingTool(BaseMCPTool):
             backend.slice()
         else:
             raise SlicingFailedError("Backend не поддерживает запуск слайсинга (нет forceSlice/slice).")
+
+    def _has_gcode_for_active_build_plate(self):
+        try:
+            from UM.Application import Application
+            app = Application.getInstance()
+        except Exception:
+            app = None
+        if app is None:
+            try:
+                from cura.CuraApplication import CuraApplication
+                app = CuraApplication.getInstance()
+            except Exception:
+                app = None
+        if app is None:
+            return False
+        try:
+            scene = app.getController().getScene()
+            try:
+                plate = int(app.getMultiBuildPlateModel().activeBuildPlate)
+            except Exception:
+                plate = 0
+            gcode = getattr(scene, "gcode_dict", {}).get(plate)
+            return bool(gcode and any(str(chunk).strip() for chunk in gcode))
+        except Exception:
+            return False
 
     def _collect_slice_stats(self):
         # type: () -> Dict[str, Any]
@@ -238,9 +271,8 @@ class SlicingTool(BaseMCPTool):
         try:
             stack = app.getGlobalContainerStack()
             if stack is not None:
-                mode_val = stack.getProperty("ste_print_mode", "value")
-                if mode_val in ("5D", "3D"):
-                    stats["mode_used"] = mode_val
+                mode_val = stack.getProperty("printing_mode", "value")
+                stats["mode_used"] = "3D" if mode_val == "classic" else ("5D" if mode_val == "cylindrical_full" else None)
         except Exception:
             pass
 

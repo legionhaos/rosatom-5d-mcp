@@ -32,20 +32,18 @@ class MainThreadDispatcher(object):
 
     @classmethod
     def _application(cls):
-        try:
-            from UM.Application import Application
-            app = Application.getInstance()
-            if app is not None:
-                return app
-        except Exception:
-            pass
-        try:
-            from cura.CuraApplication import CuraApplication
-            app = CuraApplication.getInstance()
-            if app is not None:
-                return app
-        except Exception:
-            pass
+        for module_name, class_name in (
+                ("steslicer.SteSlicerApplication", "SteSlicerApplication"),
+                ("UM.Application", "Application"),
+                ("cura.CuraApplication", "CuraApplication")):
+            try:
+                module = __import__(module_name, fromlist=[class_name])
+                app_class = getattr(module, class_name, None)
+                app = app_class.getInstance() if app_class and hasattr(app_class, "getInstance") else None
+                if app is not None:
+                    return app
+            except Exception:
+                pass
         return None
 
     @classmethod
@@ -68,11 +66,12 @@ class MainThreadDispatcher(object):
         if app is None:
             return False
         try:
-            from UM.Application import Application
             from UM.Event import CallFunctionEvent
             event = CallFunctionEvent(func, (), {})
-            Application.getInstance().functionEvent(event)
-            return True
+            poster = getattr(app, "functionEvent", None)
+            if poster is not None:
+                poster(event)
+                return True
         except Exception:
             pass
         poster = getattr(app, "callLater", None)

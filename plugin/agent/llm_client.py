@@ -114,7 +114,7 @@ class LLMConnectionConfig(object):
                  base_url="https://api.openai.com/v1",
                  api_key="",
                  model="gpt-3.5-turbo",
-                 timeout=60.0,
+                 timeout=180.0,
                  verify_ssl=True,
                  max_retries=3,
                  retry_delay=1.0):
@@ -122,7 +122,7 @@ class LLMConnectionConfig(object):
         self.base_url = (base_url or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
         self.model = (model or "").strip()
-        self.timeout = float(timeout) if timeout is not None else 60.0
+        self.timeout = float(timeout) if timeout is not None else 180.0
         self.verify_ssl = bool(verify_ssl)
         self.max_retries = int(max_retries) if max_retries is not None else 3
         self.retry_delay = float(retry_delay) if retry_delay is not None else 1.0
@@ -518,6 +518,10 @@ class OpenAICompatibleClient(object):
             payload["tools"] = tools
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
+            if "enable_thinking" not in payload:
+                model_lower = str(target_model).lower()
+                if any(k in model_lower for k in ("qwen", "dashscope", "deepseek", "reasoner", "thinking")):
+                    payload["enable_thinking"] = False
 
         if temperature is not None:
             payload["temperature"] = temperature
@@ -565,6 +569,14 @@ class OpenAICompatibleClient(object):
                 except Exception:
                     pass
 
+                # If server rejects enable_thinking, strip it and retry immediately
+                if status_code in (400, 422) and "enable_thinking" in payload:
+                    self.logger.debug("Provider rejected enable_thinking (%s). Retrying without it.", err_body)
+                    del payload["enable_thinking"]
+                    payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    headers["Content-Length"] = str(len(payload_bytes))
+                    continue
+
                 if status_code in self.RETRYABLE_STATUS_CODES and attempt < self.max_retries:
                     retry_after = self._get_retry_after(e.headers)
                     if retry_after is not None and retry_after > 0:
@@ -592,10 +604,22 @@ class OpenAICompatibleClient(object):
                     response_body=err_body
                 )
 
+            except (socket.timeout, TimeoutError) as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    sleep_time = self.retry_delay * (2 ** attempt)
+                    self.logger.warning(
+                        "Socket timeout on %s. Retrying in %.2fs (attempt %d/%d)...",
+                        url, sleep_time, attempt + 1, self.max_retries
+                    )
+                    time.sleep(sleep_time)
+                    continue
+                raise LLMTimeoutError("Request to {0} timed out after {1}s: {2}".format(url, self.timeout, str(e)))
+
             except urllib.error.URLError as e:
                 last_error = e
                 reason = getattr(e, "reason", None)
-                is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
+                is_timeout = isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason).lower()
 
                 if attempt < self.max_retries:
                     sleep_time = self.retry_delay * (2 ** attempt)

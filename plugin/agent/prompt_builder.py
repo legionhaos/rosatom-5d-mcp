@@ -104,7 +104,7 @@ class SystemPromptBuilder(object):
             self._render_header_and_role(),
             self._render_mandatory_pipeline(),
             self._render_domain_knowledge_rules(),
-            self._render_materials_and_profiles(),
+            self._render_materials_and_profiles(snapshot),
             self._render_slicer_snapshot(snapshot),
             self._render_final_response_requirements()
         ]
@@ -148,25 +148,28 @@ class SystemPromptBuilder(object):
             "     минимальной толщины стенок, критических углов нависания (> 45-60°), наличия тел вращения\n"
             "     (осесимметричности), трубчатых полостей, консольных выступов и предполагаемых векторов механических нагрузок.\n\n"
             "2. select_print_mode_and_profile\n"
-            "   - ЦЕЛЬ: Выбрать оптимальный режим печати (5D или 3D), профиль качества и материал.\n"
-            "   - ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ: Сопоставление результатов геометрического анализа с правилами выбора\n"
-            "     технологии. Определение режима (\"5D\" для многоосевой прочности и исключения поддержек,\n"
-            "     либо \"3D\" для плоских призматических деталей), выбор профиля слайсинга (например, 5D_structural,\n"
-            "     5D_precision, 3D_standard) и совместимого материала из snapshot.available_materials;\n"
+            "   - ЦЕЛЬ: Выбрать режим печати (5D или 3D) и активировать материал в STE Slicer.\n"
+            "   - ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ: Определение режима (\"5D\" для многоосевой прочности и исключения поддержек,\n"
+            "     либо \"3D\" для простых плоских деталей) и выбор точного имени материала из списка доступных в слайсере\n"
+            "     (например: \"CFF PA\", \"Generic PETG\", \"Generic PLA\").\n"
+            "     Параметр profile опционален (например, \"normal\" или стратегия \"5D_structural\");\n"
             "     если доступных материалов нет, не утверждай, что материал применен — сообщи об этом.\n\n"
             "3. modify_scene_and_parameters\n"
             "   - ЦЕЛЬ: Применить оптимальную пространственную ориентацию детали и задать технологические параметры.\n"
             "   - ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ: \n"
-            "     * Вращение и трансформация детали в сцене (углы rx, ry, rz) для совмещения главных направлений\n"
-            "       растяжения/изгиба с траекториями нитей и устранения необходимости поддержек за счет наклона стола.\n"
-            "     * Установка параметров слайсера: высота слоя (layer_height), число периметров/стенок (wall_line_count),\n"
-            "       процент и рисунок заполнения (infill_density, infill_pattern), температура сопла (print_temperature),\n"
-            "       температура подогреваемого стола (bed_temperature), скорость обдува (fan_speed), поддержки (support_enabled).\n\n"
-            "4. run_slicing_and_generate_gcode\n"
-            "   - ЦЕЛЬ: Запуск процесса генерации управляющей программы (G-кода) в ядре STE Slicer.\n"
-            "   - ВЫПОЛНЯЕМЫЕ ДЕЙСТВИЯ: Передача сконфигурированных настроек в слайсер, расчет траекторий,\n"
-            "     получение финальных метрик печати (время изготовления, расход нити в граммах и метрах,\n"
-            "     число слоев) и проверка успешности формирования G-кода."
+            "     * Вращение и трансформация детали в сцене: передай rotation_euler_deg=[rx, ry, rz] "
+            "(используй углы из поля best_orientation.rotation_euler_deg, полученного на шаге analyze_mesh_geometry, "
+            "например [0.0, 0.0, 0.0], [90.0, 0.0, 0.0] или [-90.0, 0.0, 0.0]).\n"
+            "     * Установка параметров слайсера в объекте print_parameters: layer_height (высота слоя, мм), "
+            "wall_line_count (число стенок), infill_sparse_density (процент заполнения, %), "
+            "infill_pattern (рисунок заполнения, например 'gyroid', 'grid'), "
+            "material_print_temperature (температура сопла, °C), material_bed_temperature (температура стола, °C), "
+            "cool_fan_speed (скорость обдува, %).\n"
+            "     * supports_enabled: логическое значение (true/false) — отключи поддержки (false) для 5D-печати.\n"
+            "   - ВАЖНО: Вызов modify_scene_and_parameters ОБЯЗАТЕЛЕН сразу после select_print_mode_and_profile! "
+            "После вызова modify_scene_and_parameters автоматический конвейер инструментов завершён. "
+            "Сразу переходи к формулированию полного инженерного отчета пользователю. "
+            "НЕ вызывай инструменты генерации G-кода или слайсинга — слайсинг и экспорт запускаются пользователем вручную по кнопке «Экспорт» после ознакомления с твоими рекомендациями."
         )
 
     def _render_domain_knowledge_rules(self):
@@ -204,37 +207,45 @@ class SystemPromptBuilder(object):
             support_rules=support_rules
         )
 
-    def _render_materials_and_profiles(self):
-        # type: () -> str
-        """Section 4: Technical reference for materials and slicing profiles."""
+    def _render_materials_and_profiles(self, snapshot=None):
+        # type: (Optional[Dict[str, Any]]) -> str
+        """Section 4: Technical reference for materials and slicing profiles parsed from the slicer."""
         kb = self.knowledge_base
-        materials = kb.get("materials_catalog", {})
-        profiles = kb.get("slicing_profiles", {})
         heuristics = kb.get("parameter_heuristics", {})
+        profiles = kb.get("slicing_profiles", {})
+
+        avail_materials = []
+        if isinstance(snapshot, dict):
+            avail_materials = snapshot.get("available_materials") or []
 
         mat_lines = []
-        for mat_id, m in sorted(materials.items()):
-            mat_lines.append(
-                "   * {name} ({m_type}):\n"
-                "     - Температура сопла: {t_nozzle}°C (диапазон {t_min_n}-{t_max_n}°C)\n"
-                "     - Температура стола: {t_bed}°C (диапазон {t_min_b}-{t_max_b}°C)\n"
-                "     - Обдув вентилятором: {fan}%\n"
-                "     - Предел прочности: ~{strength} МПа | Плотность: {density} г/см³\n"
-                "     - Особенности: {feat}".format(
-                    name=m.get("name", mat_id),
-                    m_type=m.get("type", "Термопласт"),
-                    t_nozzle=m.get("nozzle_temp_recommended", 210),
-                    t_min_n=m.get("nozzle_temp_range", [190, 230])[0],
-                    t_max_n=m.get("nozzle_temp_range", [190, 230])[1],
-                    t_bed=m.get("bed_temp_recommended", 60),
-                    t_min_b=m.get("bed_temp_range", [50, 70])[0],
-                    t_max_b=m.get("bed_temp_range", [50, 70])[1],
-                    fan=m.get("fan_speed", 100),
-                    strength=m.get("tensile_strength_mpa", 50),
-                    density=m.get("density_g_cm3", 1.2),
-                    feat=m.get("features", "")
-                )
-            )
+        if avail_materials:
+            for m in avail_materials:
+                name = m.get("name", "") if isinstance(m, dict) else str(m)
+                t_nozzle = m.get("recommended_temp_nozzle") if isinstance(m, dict) else None
+                t_bed = m.get("recommended_temp_bed") if isinstance(m, dict) else None
+                fan = m.get("recommended_fan") if isinstance(m, dict) else None
+                aliases = m.get("aliases") if isinstance(m, dict) else []
+
+                extra = []
+                if t_nozzle:
+                    extra.append("сопло: ~{0}°C".format(t_nozzle))
+                if t_bed:
+                    extra.append("стол: ~{0}°C".format(t_bed))
+                if fan is not None:
+                    extra.append("обдув: {0}%".format(fan))
+                extra_str = (" (" + ", ".join(extra) + ")") if extra else ""
+
+                alias_str = (" [Синонимы: " + ", ".join(aliases) + "]") if aliases else ""
+                mat_lines.append("   * \"{0}\"{extra}{aliases}".format(name, extra=extra_str, aliases=alias_str))
+        else:
+            mat_lines = [
+                "   * \"CFF PA\" (сопло: ~265°C, стол: ~70°C, обдув: 0%) [Синонимы: PA6-CF, Carbon Nylon, PA-CF, Угленаполненный полиамид] — ОСНОВНОЙ ВЫБОР ДЛЯ 5D и силовых деталей",
+                "   * \"Generic PETG\" (сопло: ~235°C, стол: ~75°C, обдув: 40%) [Синонимы: PETG] — Универсальный прочный материал",
+                "   * \"Generic PLA\" (сопло: ~205°C, стол: ~60°C, обдув: 100%) [Синонимы: PLA] — Прототипирование, декоративные детали",
+                "   * \"Generic ABS\" (сопло: ~240°C, стол: ~100°C, обдув: 0%) [Синонимы: ABS] — Термостойкие ударопрочные детали",
+                "   * \"Generic TPU 95A\" (сопло: ~225°C, стол: ~60°C, обдув: 20%) [Синонимы: TPU, Flex] — Гибкие упругие изделия",
+            ]
 
         prof_lines = []
         for prof_id, p in sorted(profiles.items()):
@@ -256,8 +267,11 @@ class SystemPromptBuilder(object):
             "================================================================================\n"
             "СПРАВОЧНИК МАТЕРИАЛОВ И ТЕХНОЛОГИЧЕСКИХ ПАРАМЕТРОВ STE SLICER\n"
             "================================================================================\n"
-            "1. БАЗА МАТЕРИАЛОВ:\n{materials_block}\n\n"
-            "2. БАЗОВЫЕ ПРОФИЛИ СЛАЙСИНГА:\n{profiles_block}\n\n"
+            "1. ДОСТУПНЫЕ МАТЕРИАЛЫ В STE SLICER:\n"
+            "   ВНИМАНИЕ: В select_print_mode_and_profile передавай параметр material СТРОГО\n"
+            "   в виде одного из точных имен из списка ниже (например: material='CFF PA' или material='Generic PETG')!\n"
+            "{materials_block}\n\n"
+            "2. СТРАТЕГИИ ПОДБОРА ПАРАМЕТРОВ (применяются в modify_scene_and_parameters):\n{profiles_block}\n\n"
             "3. ТЕХНОЛОГИЧЕСКИЕ ПРАВИЛА ПОДБОРА ПАРАМЕТРОВ:\n"
             "   * СТЕНКИ (Wall Line Count): {h_walls}\n"
             "   * ПЛОТНОСТЬ И ПАТТЕРН ЗАПОЛНЕНИЯ: {h_infill}\n"
@@ -344,7 +358,7 @@ class SystemPromptBuilder(object):
             models_block = "  (В текущей сцене нет загруженных деталей. Ожидается загрузка 3D-модели пользователем)"
 
         # 3. Available materials & profiles
-        mat_str = ", ".join(str(m) for m in avail_materials) if avail_materials else "материалы не удалось определить в слайсере"
+        mat_str = ", ".join(m.get("name", str(m)) if isinstance(m, dict) else str(m) for m in avail_materials) if avail_materials else "Generic PETG, Generic PLA, Generic ABS, Generic CFF PA (PA6-CF), Generic TPU 95A"
         prof_str = ", ".join(str(p) for p in avail_profiles) if avail_profiles else "5D_structural, 5D_precision, 3D_standard"
 
         # 4. Active settings

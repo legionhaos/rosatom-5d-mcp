@@ -23,7 +23,7 @@ DEFAULTS = {
     "api_url": "",
     "api_key": "",
     "model_name": "gpt-4o-mini",
-    "timeout_sec": 120,
+    "timeout_sec": 180,
     "temperature": 0.1,
     "results_dir": "",
 }

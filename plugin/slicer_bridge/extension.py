@@ -208,8 +208,8 @@ class STEAIExtension(QObject, Extension):
         if self._app_override is not None:
             return self._app_override
         try:
-            from cura.CuraApplication import CuraApplication
-            app = CuraApplication.getInstance()
+            from steslicer.SteSlicerApplication import SteSlicerApplication
+            app = SteSlicerApplication.getInstance()
             if app is not None:
                 return app
         except Exception:
@@ -217,6 +217,13 @@ class STEAIExtension(QObject, Extension):
         try:
             from UM.Application import Application
             app = Application.getInstance()
+            if app is not None:
+                return app
+        except Exception:
+            pass
+        try:
+            from cura.CuraApplication import CuraApplication
+            app = CuraApplication.getInstance()
             if app is not None:
                 return app
         except Exception:
@@ -257,6 +264,7 @@ class STEAIExtension(QObject, Extension):
                 event_listener=self._event_listener,
                 camera_manager=self._camera_manager,
                 dispatcher=self._dispatcher,
+                application=app,
             )
         except Exception as exc:
             logger.error("Не удалось создать MCPServer: %s", exc)
@@ -266,6 +274,7 @@ class STEAIExtension(QObject, Extension):
             self._orchestrator = AgentOrchestrator(
                 settings_mgr=self._settings_mgr,
                 mcp_server=self._mcp_server,
+                application=app,
             )
         except Exception as exc:
             logger.error("Не удалось создать AgentOrchestrator: %s", exc)
@@ -351,11 +360,15 @@ class STEAIExtension(QObject, Extension):
             return
         if not getattr(self, "_scene_watch_connected", False):
             app = self._application()
-            try:
-                app.getController().getScene().sceneChanged.connect(self._controller.onSceneChanged)
-                self._scene_watch_connected = True
-            except Exception as exc:
-                logger.warning("Не удалось подписаться на sceneChanged: %s", exc)
+            if app is not None:
+                try:
+                    controller = getattr(app, "getController", lambda: None)()
+                    scene = controller.getScene() if controller else None
+                    if scene is not None:
+                        scene.sceneChanged.connect(self._controller.onSceneChanged)
+                        self._scene_watch_connected = True
+                except Exception as exc:
+                    logger.warning("Не удалось подписаться на sceneChanged: %s", exc)
         self._controller.refreshModelCount()
 
     @pyqtSlot()
