@@ -394,8 +394,15 @@ class ConversationContextManager(object):
                     if not callable(mesh_getter) or mesh_getter() is None:
                         continue
 
-                    # Ignore convex hull preview nodes and helper meshes
-                    if type(child).__name__ == "ConvexHullNode" or hasattr(child, "getHull"):
+                    # Ignore the build plate grid and preview/helper meshes.
+                    node_type = type(child).__name__.lower()
+                    node_name = str(getattr(child, "getName", lambda: "")() or "").lower()
+                    helper_tokens = ("buildplate", "build_plate", "build plate", "grid", "convexhull", "convex_hull", "hull")
+                    if any(token in node_type or token in node_name for token in helper_tokens):
+                        continue
+                    if hasattr(child, "getHull"):
+                        continue
+                    if hasattr(child, "getHull"):
                         continue
 
                     # Skip explicitly non-printing meshes and nested mesh components;

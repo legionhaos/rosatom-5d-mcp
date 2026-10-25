@@ -61,7 +61,10 @@ class PluginSettingsManager(object):
         if self._prefs is None:
             return
         for key, value in DEFAULTS.items():
-            self._prefs.addPreference(PREFIX + key, value)
+            try:
+                self._prefs.addPreference(PREFIX + key, value)
+            except Exception:
+                pass
 
     def _load_file(self):
         if self._file_cache is None:
@@ -103,12 +106,19 @@ class PluginSettingsManager(object):
         with self._lock:
             if self._prefs is not None:
                 self._prefs.setValue(PREFIX + key, value)
+                stored = self._prefs.getValue(PREFIX + key)
+                if stored != value:
+                    raise ConfigError("Preferences не подтвердили запись ключа '{0}'.".format(key))
                 return
             data = self._load_file()
             data[key] = value
             os.makedirs(os.path.dirname(_FALLBACK_FILE), exist_ok=True)
             with open(_FALLBACK_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            with open(_FALLBACK_FILE, "r", encoding="utf-8") as f:
+                self._file_cache = json.load(f)
+            if self._file_cache.get(key) != value:
+                raise ConfigError("Не удалось подтвердить запись настройки '{0}'.".format(key))
 
     def _get(self, key):
         """Сохранённое значение -> env -> дефолт."""

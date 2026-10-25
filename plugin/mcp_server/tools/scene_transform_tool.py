@@ -96,6 +96,10 @@ except (ImportError, AttributeError):
 class SceneTransformTool(BaseMCPTool):
     """MCP tool for spatial scene transformations and slicer stack parameter modifications."""
 
+    def __init__(self, dispatcher=None, application=None):
+        self._dispatcher = dispatcher or MainThreadDispatcher
+        self._application_override = application
+
     name = "modify_scene_and_parameters"
     description = (
         "Applies spatial transformations (rotation, build plate drop, arrangement) "
@@ -214,7 +218,7 @@ class SceneTransformTool(BaseMCPTool):
 
             warnings = []  # type: List[str]
 
-            result = MainThreadDispatcher.run_sync(
+            result = self._dispatcher.run_sync(
                 self._apply_transforms_and_settings,
                 node_id=node_id,
                 file_path=file_path,
@@ -261,12 +265,13 @@ class SceneTransformTool(BaseMCPTool):
         from UM.Math.Quaternion import Quaternion
         from UM.Math.Vector import Vector
 
-        app = None
-        try:
-            from UM.Application import Application
-            app = Application.getInstance()
-        except Exception:
-            pass
+        app = self._application_override
+        if app is None:
+            try:
+                from UM.Application import Application
+                app = Application.getInstance()
+            except Exception:
+                pass
         if app is None and CuraApplication is not None:
             try:
                 app = CuraApplication.getInstance()
@@ -428,8 +433,12 @@ class SceneTransformTool(BaseMCPTool):
         for node in all_nodes:
             if not (hasattr(node, "getMeshData") and node.getMeshData() is not None):
                 continue
-            # Ignore ConvexHullNode and helper meshes
-            if type(node).__name__ == "ConvexHullNode" or hasattr(node, "getHull"):
+            node_type = type(node).__name__.lower()
+            node_name = str(getattr(node, "getName", lambda: "")() or "").lower()
+            helper_tokens = ("buildplate", "build_plate", "build plate", "grid", "convexhull", "convex_hull", "hull")
+            if any(token in node_type or token in node_name for token in helper_tokens):
+                continue
+            if hasattr(node, "getHull"):
                 continue
             if hasattr(node, "callDecoration"):
                 try:
@@ -477,75 +486,62 @@ class SceneTransformTool(BaseMCPTool):
 
     def _resolve_node(self, app, scene, file_path, node_id):
         """Retrieve SceneNode by identifier or import from file."""
-        placeholders = {
-            "model", "current_model", "current", "active", "default",
-            "selected", "scene", "none", "null", "part", "object", ""
-        }
-        clean_node_id = str(node_id).strip() if node_id is not None else None
-        if clean_node_id and clean_node_id.lower() in placeholders:
-            clean_node_id = None
-
-        candidates = self._get_printable_candidates(scene)
-
-        if clean_node_id:
-            found = self._find_node_by_id(scene.getRoot(), clean_node_id)
+        if node_id:
+            found = self._find_node_by_id(scene.getRoot(), str(node_id))
             if found:
-                return found
-
-            # Search among printable candidates by partial match on name or ID
-            target_str = clean_node_id.lower()
-            for cand in candidates:
-                cand_name = str(getattr(cand, "getName", lambda: "")()).lower()
-                cand_id = str(getattr(cand, "getId", lambda: "")()).lower()
-                if target_str in cand_name or target_str in cand_id or os.path.splitext(target_str)[0] in cand_name:
-                    return cand
-
-            if len(candidates) == 1:
-                return candidates[0]
-            selected = self._get_selected_mesh_node(scene)
-            if selected:
-                return selected
-            raise SceneError("Scene node was not found.", details={"node_id": node_id, "available_candidates": [str(getattr(n, "getName", lambda: "")()) for n in candidates]})
+                if getattr(found, "getMeshData", lambda: None)() is not None:
+                    return found
+                mesh_child = self._find_first_mesh_node(found)
+                if mesh_child is not None:
+                    return mesh_child
 
         if file_path:
-            clean_file_path = str(file_path).strip()
-            if clean_file_path:
-                base_name = os.path.basename(clean_file_path).lower()
-                base_stem = os.path.splitext(base_name)[0]
-                for cand in candidates:
-                    cand_name = str(getattr(cand, "getName", lambda: "")()).lower()
-                    if cand_name == base_name or os.path.splitext(cand_name)[0] == base_stem:
-                        return cand
+            if not os.path.exists(file_path):
+                raise MeshError("File not found: {}".format(file_path))
+            handler = app.getMeshFileHandler()
+            reader = getattr(handler, "read", None) if handler is not None else None
+            if reader is not None:
+                loaded = reader(file_path)
+                if loaded:
+                    loaded_nodes = loaded if isinstance(loaded, (list, tuple)) else [loaded]
+                    loaded_candidates = self._get_printable_candidates_from_nodes(loaded_nodes)
+                    if loaded_candidates:
+                        return loaded_candidates[0]
 
-                if not os.path.exists(clean_file_path):
-                    raise MeshError("File not found: {}".format(clean_file_path))
-                handler = app.getMeshFileHandler()
-                reader = getattr(handler, "read", None) if handler is not None else None
-                if reader is not None:
-                    loaded = reader(clean_file_path)
-                    if loaded:
-                        if isinstance(loaded, list) and len(loaded) > 0:
-                            return loaded[0]
-                        return loaded
+            candidates = self._get_printable_candidates(scene)
+            if candidates:
+                return candidates[-1]
 
-                new_candidates = self._get_printable_candidates(scene)
-                if len(new_candidates) == 1:
-                    return new_candidates[0]
-                for cand in new_candidates:
-                    cand_name = str(getattr(cand, "getName", lambda: "")()).lower()
-                    if cand_name == base_name or os.path.splitext(cand_name)[0] == base_stem:
-                        return cand
-                if new_candidates:
-                    return new_candidates[-1]
-
-        selected = self._get_selected_mesh_node(scene)
-        if selected:
-            if not hasattr(selected, "callDecoration") or selected.callDecoration("isSliceable") or getattr(selected, "getName", lambda: "")():
-                return selected
-
+        candidates = self._get_printable_candidates(scene)
         if candidates:
             return candidates[0]
         return None
+
+    def _find_first_mesh_node(self, parent_node):
+        """Find first printable child node containing valid MeshData."""
+        for child in parent_node.getAllChildren():
+            mesh_data = getattr(child, "getMeshData", lambda: None)()
+            if mesh_data is None or getattr(mesh_data, "getVertices", lambda: None)() is None:
+                continue
+            if (self._get_printable_candidates_from_nodes([child])
+                    and self._get_printable_candidates_from_nodes([child])[0] is child):
+                return child
+        return None
+
+    @staticmethod
+    def _get_printable_candidates_from_nodes(nodes):
+        result = []
+        for node in nodes:
+            if node is None or type(node).__name__ == "ConvexHullNode" or hasattr(node, "getHull"):
+                continue
+            if hasattr(node, "callDecoration"):
+                try:
+                    if node.callDecoration("isNonPrintingMesh"):
+                        continue
+                except Exception:
+                    pass
+            result.append(node)
+        return result
 
     def _find_node_by_id(self, parent_node, target_id):
         """Recursively locate node by ID or name."""

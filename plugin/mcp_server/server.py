@@ -193,7 +193,7 @@ class MCPServer(object):
         for tool in (
             GeometryAnalysisTool(dispatcher=self._dispatcher, application=self._application),
             ProfileModeTool(settings_mgr=self._settings_mgr),
-            SceneTransformTool(),
+            SceneTransformTool(application=self._application),
             SlicingTool(event_listener=self._event_listener),
             ValidateExportTool(settings_mgr=self._settings_mgr,
                                camera_manager=self._camera_manager,

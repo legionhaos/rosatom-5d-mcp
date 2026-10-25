@@ -7,6 +7,11 @@ import os
 from typing import Any, Dict, List, Optional
 
 try:
+    from urllib.parse import unquote, urlparse
+except ImportError:
+    from urlparse import unquote, urlparse
+
+try:
     from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 except ImportError:
     try:
@@ -87,12 +92,73 @@ class AgentBackendAdapter(QObject):
         except (TypeError, RuntimeError, AttributeError) as exc:
             logger.warning("Не удалось подключить сигналы AgentWorker: %s", exc)
 
+    @staticmethod
+    def _local_file_path(value):
+        value = str(value or "").strip()
+        if value.startswith("file:"):
+            parsed = urlparse(value)
+            value = unquote(parsed.path or "")
+            if parsed.netloc and parsed.netloc.lower() != "localhost":
+                value = "//{0}{1}".format(parsed.netloc, value)
+            elif len(value) >= 3 and value[0] == "/" and value[2] == ":":
+                value = value[1:]
+        return os.path.normpath(value)
+
+    def _load_model_attachment(self, path):
+        app = self._extension._application()
+        if app is None:
+            raise RuntimeError("Приложение слайсера недоступно; модель не загружена.")
+        controller = getattr(app, "getController", lambda: None)()
+        scene = controller.getScene() if controller else None
+        if scene is None:
+            raise RuntimeError("Сцена слайсера недоступна; модель не загружена.")
+
+        root = scene.getRoot()
+        handler = getattr(app, "getMeshFileHandler", lambda: None)()
+        if handler is None:
+            raise RuntimeError("MeshFileHandler недоступен; модель не загружена.")
+        reader = getattr(handler, "read", None)
+        if not callable(reader):
+            raise RuntimeError("MeshFileHandler.read недоступен в этой версии слайсера.")
+
+        before = set()
+        for node in root.getAllChildren():
+            if hasattr(node, "getMeshData") and node.getMeshData() is not None:
+                before.add(id(node))
+        loaded = reader(path)
+        nodes = loaded if isinstance(loaded, (list, tuple)) else ([loaded] if loaded is not None else [])
+        if not nodes:
+            nodes = [node for node in root.getAllChildren()
+                     if hasattr(node, "getMeshData") and node.getMeshData() is not None and id(node) not in before]
+        if not nodes:
+            raise RuntimeError("Слайсер не вернул загруженную модель и в сцене не появился mesh.")
+
+        for node in nodes:
+            if node is None:
+                continue
+            parent = getattr(node, "getParent", lambda: None)()
+            if parent is None:
+                root.addChild(node)
+        return True
+
     def send_prompt(self, text, attachments=None):
         # type: (str, Optional[List[str]]) -> None
         if self._worker is None:
             self.taskFailed.emit("AgentWorker недоступен.")
             return
-        paths = list(attachments or [])
+        paths = []
+        try:
+            for raw_path in attachments or []:
+                path = self._local_file_path(raw_path)
+                if not os.path.isfile(path):
+                    raise RuntimeError("Файл модели не найден: {0}".format(path))
+                if os.path.splitext(path)[1].lower() in (".stl", ".obj", ".3mf"):
+                    self._extension._dispatcher.run_sync(self._load_model_attachment, path)
+                paths.append(path)
+        except Exception as exc:
+            logger.exception("Failed loading model attachment: %s", exc)
+            self.taskFailed.emit("Не удалось загрузить модель: {0}".format(exc))
+            return
         try:
             if self._worker.isRunning():
                 self.taskFailed.emit("Агент уже обрабатывает запрос.")

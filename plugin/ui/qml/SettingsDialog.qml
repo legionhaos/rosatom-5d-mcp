@@ -32,6 +32,12 @@ Window {
             statusBanner.visible = true
             statusBanner.isError = false
             statusBannerText.text = "✓ Настройки успешно сохранены."
+            root.close()
+        }
+        onSettingsSaveFailed: {
+            statusBanner.visible = true
+            statusBanner.isError = true
+            statusBannerText.text = "✕ Не удалось сохранить настройки: " + message
         }
         onConnectionCheckFinished: {
             var ok = (typeof success !== "undefined") ? success : (typeof arguments !== "undefined" && arguments.length > 0 ? arguments[0] : false)
@@ -404,8 +410,11 @@ Window {
                         onClicked: {
                             if (activeCtrl) {
                                 activeCtrl.saveSettings(baseUrlInput.text.trim(), apiKeyInput.text.trim(), modelNameInput.text.trim())
+                            } else {
+                                statusBanner.visible = true
+                                statusBanner.isError = true
+                                statusBannerText.text = "✕ Контроллер настроек недоступен."
                             }
-                            root.close()
                         }
                     }
                 }

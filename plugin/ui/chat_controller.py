@@ -14,6 +14,14 @@ import subprocess
 import tempfile
 import time
 import re
+import logging
+
+logger = logging.getLogger("ChatController")
+
+try:
+    from urllib.parse import unquote, urlparse
+except ImportError:
+    from urlparse import unquote, urlparse
 
 try:
     from PyQt5.QtCore import QTimer, QUrl
@@ -76,6 +84,7 @@ class ChatController(QObject):
     responseReady = pyqtSignal(str)
     taskFailed = pyqtSignal(str)
     settingsSaved = pyqtSignal()
+    settingsSaveFailed = pyqtSignal(str)
     connectionCheckFinished = pyqtSignal(bool, str)
     screenshotRequested = pyqtSignal()
     exportRequested = pyqtSignal(str)
@@ -477,7 +486,17 @@ class ChatController(QObject):
 
     @pyqtSlot(str)
     def addAttachment(self, path):
-        path = (path or "").replace("file:///", "")
+        raw_path = str(path or "").strip()
+        if raw_path.startswith("file:"):
+            parsed = urlparse(raw_path)
+            path = unquote(parsed.path or "")
+            if parsed.netloc and parsed.netloc.lower() != "localhost":
+                path = "//{0}{1}".format(parsed.netloc, path)
+            elif len(path) >= 3 and path[0] == "/" and path[2] == ":":
+                path = path[1:]
+        else:
+            path = raw_path
+        path = os.path.normpath(path)
         if not path or not os.path.isfile(path):
             self._fail("Файл не найден: {0}".format(path))
             return
@@ -555,7 +574,12 @@ class ChatController(QObject):
             for node in all_nodes:
                 if not (hasattr(node, "getMeshData") and node.getMeshData() is not None):
                     continue
-                if type(node).__name__ == "ConvexHullNode" or hasattr(node, "getHull"):
+                node_type = type(node).__name__.lower()
+                node_name = str(getattr(node, "getName", lambda: "")() or "").lower()
+                helper_tokens = ("buildplate", "build_plate", "build plate", "grid", "convexhull", "convex_hull", "hull")
+                if any(token in node_type or token in node_name for token in helper_tokens):
+                    continue
+                if hasattr(node, "getHull"):
                     continue
                 if hasattr(node, "callDecoration"):
                     try:
@@ -749,24 +773,25 @@ class ChatController(QObject):
 
     @pyqtSlot(str, str, str)
     def saveSettings(self, base_url, api_key, model):
-        if self._settings is not None:
-            saved = False
-            if hasattr(self._settings, "save_llm_config") and base_url and api_key and model:
-                try:
-                    self._settings.save_llm_config(base_url, api_key, model)
-                    saved = True
-                except Exception:
-                    pass
-            setter = getattr(self._settings, "set", None)
-            if setter is not None and not saved:
-                setter("base_url", base_url)
-                setter("api_key", api_key)
-                setter("model", model)
-        if self._agent is not None:
-            configure = getattr(self._agent, "configure", None)
+        try:
+            if self._settings is None:
+                raise RuntimeError("Хранилище настроек недоступно.")
+            if hasattr(self._settings, "save_llm_config"):
+                self._settings.save_llm_config(base_url, api_key, model)
+            else:
+                self._settings.set("base_url", base_url)
+                self._settings.set("api_key", api_key)
+                self._settings.set("model", model)
+            if self._settings.get("api_url") != str(base_url or "").strip().rstrip("/"):
+                raise RuntimeError("Настройки не подтвердились после записи.")
+            configure = getattr(self._agent, "configure", None) if self._agent is not None else None
             if configure is not None:
                 configure(base_url, api_key, model)
-        self.settingsSaved.emit()
+            self.settingsSaved.emit()
+        except Exception as exc:
+            logger.exception("Failed to save LLM settings: %s", exc)
+            self.settingsSaveFailed.emit(str(exc))
+            self._fail("Не удалось сохранить настройки: {0}".format(exc))
 
     @pyqtSlot(str, str, str)
     def checkConnection(self, base_url, api_key, model):
@@ -891,8 +916,7 @@ class ChatController(QObject):
             self._last_gcode_path = report.get("result_gcode", os.path.join(export_dir, "result.gcode"))
             self._exported_directory = export_dir
             self._export_status = "Успешно экспортировано: " + os.path.basename(export_dir)
-            msg = "Файлы project.3mf и result.gcode успешно экспортированы в папку:
-{0}".format(export_dir)
+            msg = "Файлы project.3mf и result.gcode успешно экспортированы в папку:\n{0}".format(export_dir)
             self._messages.append_system(msg, self._now(), "ok")
             self.exportFinished.emit(True, msg, export_dir)
             self.recommendationChanged.emit()
