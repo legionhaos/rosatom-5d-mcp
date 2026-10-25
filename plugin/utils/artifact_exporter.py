@@ -50,6 +50,38 @@ class ArtifactExporter(object):
         return func(*args)
 
     @staticmethod
+    def _active_printable_nodes(app):
+        if app is None:
+            return []
+        try:
+            controller = getattr(app, "getController", lambda: None)()
+            scene = controller.getScene() if controller else None
+            if scene is None:
+                return []
+            root = scene.getRoot()
+            if root is None:
+                return []
+            all_children = root.getAllChildren() if hasattr(root, "getAllChildren") else root.getChildren()
+            nodes = []
+            fallback_nodes = []
+            for node in all_children:
+                try:
+                    if getattr(node, "getMeshData", lambda: None)() is None:
+                        continue
+                    if hasattr(node, "callDecoration"):
+                        if node.callDecoration("isNonPrintingMesh"):
+                            continue
+                        if node.callDecoration("isSliceable"):
+                            nodes.append(node)
+                            continue
+                    fallback_nodes.append(node)
+                except Exception:
+                    continue
+            return nodes if nodes else fallback_nodes
+        except Exception:
+            return []
+
+    @staticmethod
     def _get_application():
         for mod_name in ("steslicer.SteSlicerApplication", "cura.CuraApplication", "UM.Application"):
             try:
@@ -88,32 +120,89 @@ class ArtifactExporter(object):
         except Exception:
             return 0
 
+    @staticmethod
+    def _invoke_workspace_writer(writer, stream, nodes, mode):
+        """Invoke workspace writer safely without deadlocking.
+
+        In STE Slicer, ThreeMFWorkspaceWriter.write is decorated with @call_on_qt_thread,
+        which calls SteSlicerApplication.callLater() and waits on an Event.
+        If called from the main GUI thread, this causes a deadlock.
+        If called from a worker thread, @call_on_qt_thread works as intended.
+        """
+        from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
+        write_fn = getattr(writer, "write", None)
+        if write_fn is None:
+            return False
+
+        is_main = MainThreadDispatcher.is_main_thread() if MainThreadDispatcher else False
+        is_wrapper = getattr(write_fn, "__name__", "") == "_call_on_qt_thread_wrapper"
+
+        if is_main and is_wrapper:
+            # We are on the main thread and write() is wrapped with @call_on_qt_thread.
+            # Unwrap it so it executes directly on the current main thread:
+            unwrapped = None
+            for cell in getattr(write_fn, "__closure__", []) or []:
+                target = getattr(cell, "cell_contents", None)
+                if callable(target):
+                    unwrapped = target
+                    break
+            if unwrapped:
+                return unwrapped(writer, stream, nodes, mode)
+
+        # On background thread, or if not wrapped, call directly:
+        return write_fn(stream, nodes, mode)
+
     # ------------------------------ запись -------------------------------- #
     def save_3mf_project(self, output_path):
         # type: (str) -> bool
         """Сериализует сцену + стеки настроек (режим 3D/5D, материал, overrides) в project.3mf.
         Возвращает True, иначе бросает ArtifactExportError."""
-        def _write():
+        try:
             from UM.Mesh.MeshWriter import MeshWriter
-            app = self._get_application()
-            writer = app.getWorkspaceFileHandler().getWriter("3MFWriter")
-            if writer is None:
-                raise ArtifactExportError("Writer '3MFWriter' (проект) не найден в STE Slicer")
-            nodes = [n for n in app.getController().getScene().getRoot().getChildren()
-                     if n.callDecoration("isSliceable")]
-            tmp = output_path + ".part"
-            with open(tmp, "wb") as stream:
-                ok = writer.write(stream, nodes, MeshWriter.OutputMode.BinaryMode)
-            if not ok:
-                raise ArtifactExportError("3MFWriter вернул ошибку: %s" % writer.getInformation())
-            os.replace(tmp, output_path)
-            return True
+        except ImportError:
+            class MeshWriter(object):
+                class OutputMode(object):
+                    BinaryMode = 1
+
+        app = self._get_application()
+        if app is None:
+            raise ArtifactExportError("Приложение слайсера недоступно для экспорта 3MF.")
+
+        def _get_writer_and_nodes():
+            handler = app.getWorkspaceFileHandler() if hasattr(app, "getWorkspaceFileHandler") else None
+            writer = handler.getWriter("3MFWriter") if handler else None
+            nodes = self._active_printable_nodes(app)
+            return writer, nodes
 
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-            result = self._on_main(_write)
+            if self._dispatcher and hasattr(self._dispatcher, "execute_sync"):
+                writer, nodes = self._dispatcher.execute_sync(_get_writer_and_nodes, timeout=10.0)
+            else:
+                writer, nodes = _get_writer_and_nodes()
+        except Exception as e:
+            raise ArtifactExportError("Не удалось получить writer или узлы сцены: %s" % e)
+
+        if writer is None:
+            raise ArtifactExportError("Writer '3MFWriter' (проект) не найден в STE Slicer")
+        if not nodes:
+            raise ArtifactExportError("В сцене нет печатаемых моделей для экспорта.")
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        tmp = output_path + ".part"
+
+        try:
+            with open(tmp, "wb") as stream:
+                ok = self._invoke_workspace_writer(writer, stream, nodes, MeshWriter.OutputMode.BinaryMode)
+            if not ok:
+                raise ArtifactExportError("3MFWriter вернул ошибку: %s" % getattr(writer, "getInformation", lambda: "неизвестная ошибка")())
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+            os.replace(tmp, output_path)
             STEPluginLogger.info("project.3mf сохранён: %s" % output_path, tag="EXPORT")
-            return bool(result)
+            return True
         except ArtifactExportError:
             raise
         except Exception as e:
@@ -161,12 +250,24 @@ class ArtifactExporter(object):
         path = os.path.join(model_dir, SCREENSHOT_PATTERN % index)
 
         def _grab():
-            image = window.grabWindow()
-            if image is None or image.isNull() or not image.save(path, "PNG"):
-                raise ArtifactExportError("Не удалось сохранить скриншот окна")
-            return path
+            if window is None:
+                return None
+            try:
+                image = window.grabWindow()
+                if image is None or image.isNull():
+                    return None
+                if not image.save(path, "PNG"):
+                    return None
+                return path
+            except Exception as e:
+                STEPluginLogger.warning("Не удалось сохранить скриншот: %s" % e, tag="EXPORT")
+                return None
 
-        return self._on_main(_grab)
+        try:
+            return self._on_main(_grab)
+        except Exception as e:
+            STEPluginLogger.warning("Скриншот не сохранён: %s" % e, tag="EXPORT")
+            return None
 
     # ----------------------------- валидация ------------------------------ #
     @staticmethod

@@ -17,6 +17,7 @@ import re
 import logging
 
 logger = logging.getLogger("ChatController")
+_ASSISTANT_STALL_TIMEOUT_SEC = 45
 
 try:
     from urllib.parse import unquote, urlparse
@@ -102,6 +103,9 @@ class ChatController(QObject):
     previewChanged = pyqtSignal()
     recommendationChanged = pyqtSignal()
     cameraAngleChanged = pyqtSignal()
+    assistantStatusChanged = pyqtSignal()
+    assistantElapsedChanged = pyqtSignal()
+    assistantHealthChanged = pyqtSignal()
     _previewScheduled = pyqtSignal()
 
     def __init__(self, agent_backend=None, slicer_bridge=None, settings_store=None, extension=None, parent=None):
@@ -114,6 +118,12 @@ class ChatController(QObject):
         self._attachments = AttachmentListModel(self)
         self._tools = ToolLogModel(self)
         self._busy = False
+        self._assistant_status = ""
+        self._assistant_status_detail = ""
+        self._assistant_elapsed_sec = 0
+        self._assistant_healthy = True
+        self._assistant_last_activity = 0.0
+        self._assistant_timer = None
         self._connected = False
         self._printer = "Stereotech Hybrid 530 V5.2.4"
         self._print_mode = "3D"
@@ -135,22 +145,33 @@ class ChatController(QObject):
 
         # Recommendation fields populated from summary_card
         self._profile_name = "Стандартный профиль"
-        self._layer_height = "0.20 мм"
-        self._wall_line_count = "4 линии"
-        self._infill_density = "50%"
-        self._infill_pattern = "Gyroid"
-        self._print_temp = "250 °C"
-        self._bed_temp = "85 °C"
+        self._layer_height = "—"
+        self._nozzle_diameter = "—"
+        self._first_layer_temperature = "—"
+        self._adhesion_type = "—"
+        self._print_speed = "—"
+        self._retraction = "—"
+        self._top_bottom = "—"
+        self._brim_width = "—"
+        self._wall_line_count = "—"
+        self._infill_density = "—"
+        self._infill_pattern = "—"
+        self._print_temp = "—"
+        self._bed_temp = "—"
         self._fan_speed = "0%"
         self._support_enabled = False
-        self._support_text = "Отключены"
+        self._support_text = "—"
         self._rotation_deg = [0.0, 0.0, 0.0]
         self._last_recommendation = ""
         self._export_status = ""
         self._exported_directory = ""
         self._last_gcode_path = ""
+        self._export_worker = None
 
         if QTimer is not None:
+            self._assistant_timer = QTimer(self)
+            self._assistant_timer.setInterval(1000)
+            self._assistant_timer.timeout.connect(self._assistant_heartbeat)
             self._preview_timer = QTimer(self)
             self._preview_timer.setSingleShot(True)
             self._preview_timer.setInterval(400)
@@ -267,6 +288,34 @@ class ChatController(QObject):
         return self._layer_height
 
     @pyqtProperty(str, notify=recommendationChanged)
+    def nozzleDiameter(self):
+        return self._nozzle_diameter
+
+    @pyqtProperty(str, notify=recommendationChanged)
+    def firstLayerTemperature(self):
+        return self._first_layer_temperature
+
+    @pyqtProperty(str, notify=recommendationChanged)
+    def adhesionType(self):
+        return self._adhesion_type
+
+    @pyqtProperty(str, notify=recommendationChanged)
+    def printSpeed(self):
+        return self._print_speed
+
+    @pyqtProperty(str, notify=recommendationChanged)
+    def retraction(self):
+        return self._retraction
+
+    @pyqtProperty(str, notify=recommendationChanged)
+    def topBottomThickness(self):
+        return self._top_bottom
+
+    @pyqtProperty(str, notify=recommendationChanged)
+    def brimWidth(self):
+        return self._brim_width
+
+    @pyqtProperty(str, notify=recommendationChanged)
     def wallLineCount(self):
         return self._wall_line_count
 
@@ -335,11 +384,76 @@ class ChatController(QObject):
             return str(self._settings.get("model_name") or "")
         return ""
 
+    @pyqtProperty(str, notify=assistantStatusChanged)
+    def assistantStatus(self):
+        return self._assistant_status
+
+    @pyqtProperty(str, notify=assistantStatusChanged)
+    def assistantStatusDetail(self):
+        return self._assistant_status_detail
+
+    @pyqtProperty(int, notify=assistantElapsedChanged)
+    def assistantElapsedSec(self):
+        return self._assistant_elapsed_sec
+
+    @pyqtProperty(bool, notify=assistantHealthChanged)
+    def assistantHealthy(self):
+        return self._assistant_healthy
+
+    def _set_assistant_status(self, status, detail="", healthy=True):
+        changed = (status != self._assistant_status or detail != self._assistant_status_detail)
+        health_changed = bool(healthy) != self._assistant_healthy
+        self._assistant_status = status
+        self._assistant_status_detail = detail
+        self._assistant_healthy = bool(healthy)
+        if changed:
+            self.assistantStatusChanged.emit()
+        if health_changed:
+            self.assistantHealthChanged.emit()
+
+    def _assistant_heartbeat(self):
+        if not self._busy:
+            if self._assistant_timer is not None:
+                self._assistant_timer.stop()
+            return
+        elapsed = max(0, int(time.time() - self._assistant_started_at))
+        if elapsed != self._assistant_elapsed_sec:
+            self._assistant_elapsed_sec = elapsed
+            self.assistantElapsedChanged.emit()
+        healthy = (time.time() - self._assistant_last_activity) <= _ASSISTANT_STALL_TIMEOUT_SEC
+        status = self._assistant_status
+        detail = self._assistant_status_detail
+        if not healthy and not detail:
+            detail = "Нет событий от ИИ или инструментов больше 45 секунд. Проверьте соединение и журнал."
+        elif healthy and detail.startswith("Нет событий от ИИ"):
+            detail = ""
+        self._set_assistant_status(status, detail, healthy)
+
+    def _assistant_activity(self, status=None, detail=None):
+        self._assistant_last_activity = time.time()
+        if status is not None:
+            self._assistant_status = status
+        if detail is not None:
+            self._assistant_status_detail = detail
+        self._set_assistant_status(self._assistant_status, self._assistant_status_detail, True)
+
     def _set_busy(self, value):
         value = bool(value)
         if self._busy != value:
             self._busy = value
             self.busyChanged.emit()
+        if value:
+            now = time.time()
+            self._assistant_started_at = now
+            self._assistant_last_activity = now
+            self._assistant_elapsed_sec = 0
+            self._assistant_activity("Думаю", "Подготавливаю ответ и анализирую запрос…")
+            if self._assistant_timer is not None:
+                self._assistant_timer.start()
+        else:
+            if self._assistant_timer is not None:
+                self._assistant_timer.stop()
+            self._assistant_activity("", "")
 
     def _now(self):
         return time.strftime("%H:%M:%S")
@@ -404,16 +518,21 @@ class ChatController(QObject):
         try:
             ok, result = apply_direct(payload)
             if not ok:
-                self._fail(str(result.get("error") or "Не удалось применить параметры."))
+                err_msg = str(result.get("error") or "Не удалось применить параметры.")
+                self.parameterApplyFinished.emit(False, err_msg)
+                self._fail(err_msg)
                 return
             applied = result.get("applied_overrides") or {}
             normalized = {key: item.get("new", item.get("value")) if isinstance(item, dict) else item
                           for key, item in applied.items()}
             self._update_parameters_from_dict(normalized)
             self._messages.append_system("Параметры применены к STE Slicer. G-code не запускался.", self._now(), "ok")
+            self.parameterApplyFinished.emit(True, "Параметры успешно применены к STE Slicer")
             self.messageAdded.emit()
         except Exception as exc:
-            self._fail("Не удалось применить параметры: {0}".format(exc))
+            err_msg = "Не удалось применить параметры: {0}".format(exc)
+            self.parameterApplyFinished.emit(False, err_msg)
+            self._fail(err_msg)
 
     @pyqtSlot(str, str, str, str, str, bool)
     def applyParameters(self, layer_height, infill_density, wall_count, nozzle_temp, bed_temp, supports):
@@ -468,6 +587,7 @@ class ChatController(QObject):
             self._fail("Agent backend не подключён. Подключите AgentWorker при запуске плагина.")
             return
         self._set_busy(True)
+        self._assistant_activity("Думаю", "Отправляю запрос в ИИ…")
         self.taskStarted.emit(text)
         try:
             method = getattr(self._agent, "send_prompt", None)
@@ -590,30 +710,27 @@ class ChatController(QObject):
                 parent = getattr(node, "getParent", lambda: None)()
                 if parent is not None and getattr(parent, "getMeshData", lambda: None)() is not None:
                     continue
+                parent = getattr(node, "getParent", lambda: None)()
+                if not self._is_sliceable_node(node):
+                    continue
                 candidates.append(node)
 
-            def _is_sliceable(n):
-                if hasattr(n, "callDecoration") and n.callDecoration("isSliceable"):
-                    return True
-                p = getattr(n, "getParent", lambda: None)()
-                if p and hasattr(p, "callDecoration") and p.callDecoration("isSliceable"):
-                    return True
-                return False
-
-            sliceable = [n for n in candidates if _is_sliceable(n)]
-            if sliceable:
-                return sliceable
-
-            named = [
-                n for n in candidates
-                if getattr(n, "getName", lambda: "")() and getattr(n, "getName", lambda: "")() not in ("", "Unnamed_Mesh")
-            ]
-            if named:
-                return named
-
             return candidates
+
         except Exception:
             return []
+
+    @staticmethod
+    def _is_sliceable_node(node):
+        for candidate in (node, getattr(node, "getParent", lambda: None)()):
+            if candidate is None or not hasattr(candidate, "callDecoration"):
+                continue
+            try:
+                if candidate.callDecoration("isSliceable"):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _describe_models(self, nodes):
         parts = []
@@ -660,6 +777,8 @@ class ChatController(QObject):
         info = self._describe_models(nodes)
         self._rendering_preview = True
         try:
+            if self._slicer is not None and hasattr(self._slicer, "focus_on_build_plate"):
+                self._slicer.focus_on_build_plate("3d_isometric")
             try:
                 from steslicer.Snapshot import Snapshot
             except ImportError:
@@ -684,17 +803,23 @@ class ChatController(QObject):
         finally:
             self._rendering_preview = False
 
+    def _schedule_preview(self):
+        if self._preview_timer is not None:
+            self._preview_timer.start()
+        else:
+            self.refreshPreview()
+
     @pyqtSlot(str)
     def setCameraAngle(self, angle):
         angle = str(angle or "3d_isometric").strip()
-        self._current_angle = angle
+        self._current_angle = "3d_isometric"
         self.cameraAngleChanged.emit()
         if self._slicer is not None and hasattr(self._slicer, "focus_on_build_plate"):
             try:
-                self._slicer.focus_on_build_plate(angle)
+                self._slicer.focus_on_build_plate("3d_isometric")
             except Exception:
                 pass
-        self.refreshPreview()
+        self._schedule_preview()
 
     @pyqtSlot()
     def zoomIn(self):
@@ -703,7 +828,7 @@ class ChatController(QObject):
                 self._slicer.zoom(0.8)
             except Exception:
                 pass
-        self.refreshPreview()
+        self._schedule_preview()
 
     @pyqtSlot()
     def zoomOut(self):
@@ -712,7 +837,7 @@ class ChatController(QObject):
                 self._slicer.zoom(1.25)
             except Exception:
                 pass
-        self.refreshPreview()
+        self._schedule_preview()
 
     @pyqtSlot(float, float)
     def orbitCamera(self, delta_yaw, delta_pitch):
@@ -721,7 +846,34 @@ class ChatController(QObject):
                 self._slicer.orbit(delta_yaw, delta_pitch)
             except Exception:
                 pass
-        self.refreshPreview()
+        self._schedule_preview()
+
+    @pyqtSlot(float)
+    def zoomBy(self, factor):
+        if self._slicer is not None and hasattr(self._slicer, "zoom"):
+            try:
+                self._slicer.zoom(float(factor))
+            except Exception:
+                pass
+        self._schedule_preview()
+
+    @pyqtSlot(float, float)
+    def panCamera(self, delta_x, delta_y):
+        if self._slicer is not None and hasattr(self._slicer, "pan"):
+            try:
+                self._slicer.pan(delta_x, delta_y)
+            except Exception:
+                pass
+        self._schedule_preview()
+
+    @pyqtSlot()
+    def fitCamera(self):
+        if self._slicer is not None and hasattr(self._slicer, "fit"):
+            try:
+                self._slicer.fit()
+            except Exception:
+                pass
+        self._schedule_preview()
 
     @pyqtSlot()
     def resetCamera(self):
@@ -755,6 +907,11 @@ class ChatController(QObject):
 
     @pyqtSlot()
     def cancelRequest(self):
+        if self._export_worker is not None and getattr(self._export_worker, "isRunning", lambda: False)():
+            try:
+                self._export_worker.cancel()
+            except Exception:
+                pass
         if self._agent is not None:
             cancel = getattr(self._agent, "cancel", None)
             if cancel is not None:
@@ -832,33 +989,26 @@ class ChatController(QObject):
 
     @pyqtSlot(str)
     def generateGcode(self, model_name):
-        """Run the slicer's current slicing backend, then export generated files."""
+        """Run the slicer's current slicing backend asynchronously, then export generated files."""
         model_name = (model_name or "model_submission").strip()
         if self._busy:
             return
-        slicer = getattr(self._agent, "_orchestrator", None) if self._agent is not None else None
-        mcp = getattr(slicer, "mcp_server", None)
-        if mcp is None:
-            self._fail("MCPServer недоступен: не удалось запустить слайсинг.")
-            return
-        self._set_busy(True)
-        try:
-            result = mcp.call_tool("run_slicing_and_generate_gcode", {"timeout_sec": 180})
-            if not isinstance(result, dict) or str(result.get("status", "")).lower() in ("error", "failed"):
-                raise RuntimeError((result or {}).get("error", "Слайсер не создал G-code."))
-            self._messages.append_system("G-code создан слайсером. Экспортирую проект…", self._now(), "ok")
-            self._set_busy(False)
-            self.exportResult(model_name)
-        except Exception as exc:
-            self._fail("Не удалось создать G-code: {0}".format(exc))
-        finally:
-            self._set_busy(False)
+        results_dir = os.environ.get("STE_AI_RESULTS_DIR")
+        if not results_dir and self._settings is not None:
+            results_dir = getattr(self._settings, "results_dir", None)
+        if not results_dir:
+            results_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                "results",
+                model_name
+            )
+        self.exportResultToFolder(results_dir, model_name)
 
     @pyqtSlot(str)
     @pyqtSlot(str, str)
     def exportResultToFolder(self, folder_path, model_name="model_submission"):
-        """Exports project.3mf and result.gcode directly to the specified folder.
-        If the scene has not been sliced yet, runs slicing first."""
+        """Exports project.3mf and result.gcode directly to the specified folder asynchronously.
+        If the scene has not been sliced yet, runs slicing in a background thread."""
         if not folder_path:
             return
 
@@ -881,96 +1031,77 @@ class ChatController(QObject):
         model_name = (model_name or "model_submission").strip()
         self.exportRequested.emit(model_name)
         self._set_busy(True)
+        self._assistant_activity("Экспорт", "Инициализация экспорта проекта…")
+
+        slicer = getattr(self._agent, "_orchestrator", None) if self._agent is not None else None
+        mcp = getattr(slicer, "mcp_server", None)
+
+        chat_window = None
+        if self._slicer is not None and hasattr(self._slicer, "get_chat_window"):
+            chat_window = self._slicer.get_chat_window()
+        elif self._extension is not None and hasattr(self._extension, "_chat_view"):
+            chat_window = getattr(self._extension, "_chat_view", None)
+
+        from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
+        from plugin.utils.export_worker import ExportWorker
 
         try:
-            from plugin.utils.artifact_exporter import ArtifactExporter
-            from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
-
-            # Check if G-code is already available in the scene
-            app = ArtifactExporter._get_application()
-            scene = app.getController().getScene() if app is not None and hasattr(app, "getController") else None
-            gcode_dict = getattr(scene, "gcode_dict", {}) if scene is not None else {}
-            has_gcode = bool(gcode_dict and any(gcode_dict.values()))
-
-            if not has_gcode:
-                self._messages.append_system("Подготовка G-кода: выполняется нарезка сцены...", self._now(), "pending")
+            if self._export_worker is not None and getattr(self._export_worker, "isRunning", lambda: False)():
+                self._messages.append_system("Экспорт уже выполняется…", self._now(), "warning")
                 self.messageAdded.emit()
-                slicer = getattr(self._agent, "_orchestrator", None) if self._agent is not None else None
-                mcp = getattr(slicer, "mcp_server", None)
-                if mcp is not None:
-                    res = mcp.call_tool("run_slicing_and_generate_gcode", {"timeout_sec": 180})
-                    if isinstance(res, dict) and str(res.get("status", "")).lower() in ("error", "failed"):
-                        err = res.get("message") or res.get("error") or "Ошибка слайсинга"
-                        self._messages.append_system("Предупреждение: {0}".format(err), self._now(), "warning")
+                return
 
-            chat_window = None
-            if self._slicer is not None and hasattr(self._slicer, "get_chat_window"):
-                chat_window = self._slicer.get_chat_window()
-            elif self._extension is not None and hasattr(self._extension, "_chat_view"):
-                chat_window = getattr(self._extension, "_chat_view", None)
-
-            exporter = ArtifactExporter(clean_path, dispatcher=MainThreadDispatcher)
-            report = exporter.export_all_for_model(model_name, chat_window=chat_window, validate=False, target_dir=clean_path)
-
-            export_dir = report.get("directory", clean_path)
-            self._last_gcode_path = report.get("result_gcode", os.path.join(export_dir, "result.gcode"))
-            self._exported_directory = export_dir
-            self._export_status = "Успешно экспортировано: " + os.path.basename(export_dir)
-            msg = "Файлы project.3mf и result.gcode успешно экспортированы в папку:\n{0}".format(export_dir)
-            self._messages.append_system(msg, self._now(), "ok")
-            self.exportFinished.emit(True, msg, export_dir)
-            self.recommendationChanged.emit()
-            self.messageAdded.emit()
-
+            self._export_worker = ExportWorker(
+                target_dir=clean_path,
+                model_name=model_name,
+                mcp_server=mcp,
+                chat_window=chat_window,
+                dispatcher=MainThreadDispatcher,
+                parent=self
+            )
+            self._export_worker.progressChanged.connect(self._on_export_progress)
+            self._export_worker.exportFinished.connect(self._on_export_finished)
+            self._export_worker.start()
         except Exception as exc:
-            err = "Экспорт не выполнен: {0}".format(exc)
-            self._export_status = err
+            err = "Не удалось запустить экспорт: {0}".format(exc)
             self._fail(err)
             self.exportFinished.emit(False, err, "")
-            self.recommendationChanged.emit()
-        finally:
-            self._set_busy(False)
 
     @pyqtSlot(str)
     def exportResult(self, model_name):
         model_name = (model_name or "model").strip()
-        self.exportRequested.emit(model_name)
-        try:
-            from plugin.utils.artifact_exporter import ArtifactExporter
-            from plugin.slicer_bridge.main_thread_dispatcher import MainThreadDispatcher
+        results_dir = os.environ.get("STE_AI_RESULTS_DIR")
+        if not results_dir and self._settings is not None:
+            results_dir = getattr(self._settings, "results_dir", None)
+        if not results_dir:
+            results_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                "results",
+                model_name
+            )
+        self.exportResultToFolder(results_dir, model_name)
 
-            results_dir = os.environ.get("STE_AI_RESULTS_DIR")
-            if not results_dir and self._settings is not None:
-                results_dir = getattr(self._settings, "results_dir", None)
-            if not results_dir:
-                results_dir = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                    "results"
-                )
+    @pyqtSlot(str, str)
+    def _on_export_progress(self, step, detail):
+        self._assistant_activity(step, detail)
+        self._messages.append_system("{0}: {1}".format(step, detail), self._now(), "pending")
+        self.messageAdded.emit()
 
-            chat_window = None
-            if self._slicer is not None and hasattr(self._slicer, "get_chat_window"):
-                chat_window = self._slicer.get_chat_window()
-            elif self._extension is not None and hasattr(self._extension, "_chat_view"):
-                chat_window = getattr(self._extension, "_chat_view", None)
-
-            exporter = ArtifactExporter(results_dir, dispatcher=MainThreadDispatcher)
-            report = exporter.export_all_for_model(model_name, chat_window=chat_window, validate=False)
-
-            export_dir = report.get("directory", "")
-            self._last_gcode_path = report.get("result_gcode", "")
+    @pyqtSlot(bool, str, str)
+    def _on_export_finished(self, ok, msg, export_dir):
+        self._set_busy(False)
+        if ok:
             self._exported_directory = export_dir
+            self._last_gcode_path = os.path.join(export_dir, "result.gcode")
             self._export_status = "Успешно экспортировано: " + os.path.basename(export_dir)
-            msg = "Артефакты {0} успешно сохранены в results/".format(os.path.basename(export_dir))
             self._messages.append_system(msg, self._now(), "ok")
             self.exportFinished.emit(True, msg, export_dir)
-            self.recommendationChanged.emit()
-            self.messageAdded.emit()
-        except Exception as exc:
-            err = "Экспорт не выполнен: {0}".format(exc)
-            self._export_status = err
-            self.exportFinished.emit(False, err, "")
-            self.recommendationChanged.emit()
+        else:
+            self._export_status = msg
+            self._fail(msg)
+            self.exportFinished.emit(False, msg, "")
+        self.recommendationChanged.emit()
+        self.messageAdded.emit()
 
     @pyqtSlot(str)
     def openFolder(self, path):
@@ -996,11 +1127,13 @@ class ChatController(QObject):
     # Slots for AgentWorker / SlicerIntegrationBridge signals.
     @pyqtSlot(str, str)
     def onAgentStepStarted(self, step, detail):
+        self._assistant_activity(str(step or "Думаю"), str(detail or "ИИ обрабатывает запрос…"))
         self._messages.append_system("{0} {1}".format(step, detail).strip(), self._now(), "pending")
         self.messageAdded.emit()
 
     @pyqtSlot(str, str, object)
     def onToolCallStarted(self, tool_name, label, arguments=None):
+        self._assistant_activity("Выполняю шаг", "ИИ вызывает {0}…".format(tool_name))
         args_dict = arguments if isinstance(arguments, dict) else {}
         if isinstance(arguments, str):
             try:
@@ -1020,6 +1153,7 @@ class ChatController(QObject):
 
     @pyqtSlot(str, str, object, int)
     def onToolCallFinished(self, tool_name, status, result=None, duration_ms=0):
+        self._assistant_activity("Думаю", "Обрабатываю результат шага…")
         res_dict = result if isinstance(result, dict) else {}
         if isinstance(result, str):
             try:
@@ -1050,6 +1184,11 @@ class ChatController(QObject):
     @staticmethod
     def _markdown_to_html(text):
         """Render safe, lightweight Markdown using Qt rich-text HTML."""
+        if not text:
+            return ""
+        s = str(text)
+        if s.lstrip().startswith("<html>"):
+            return s
         import html
 
         lines = str(text or "").splitlines()
@@ -1122,6 +1261,30 @@ class ChatController(QObject):
             layer_height = layer_height.get("new", layer_height.get("value"))
         if layer_height is not None:
             self._layer_height = "{0:.2f} мм".format(float(layer_height))
+        nozzle = value("nozzle_diameter_mm", "machine_nozzle_size", "nozzle_diameter")
+        if nozzle is not None:
+            self._nozzle_diameter = "{0} мм".format(nozzle)
+        first_layer_height = value("first_layer_height_mm", "layer_height_0", "layer_height_first_layer")
+        if first_layer_height is not None:
+            self._layer_height = "{0:.2f} / {1:.2f} мм".format(float(value("layer_height_mm", "layer_height") or 0.2), float(first_layer_height))
+        first_temp = value("first_layer_temperature_c", "material_print_temperature_layer_0", "first_layer_temperature")
+        if first_temp is not None:
+            self._first_layer_temperature = "{0} °C".format(first_temp)
+        adhesion = value("adhesion_type", "build_plate_adhesion")
+        if adhesion is not None:
+            self._adhesion_type = str(adhesion).capitalize()
+        top_bottom = value("top_bottom_thickness")
+        if top_bottom is not None:
+            self._top_bottom = "{0} мм".format(top_bottom)
+        brim = value("brim_width_mm", "brim_width")
+        if brim is not None:
+            self._brim_width = "{0} мм".format(brim)
+        speed = value("print_speed_mm_s", "speed_print", "print_speed")
+        if speed is not None:
+            self._print_speed = "{0} мм/с".format(speed)
+        retract = value("retraction_amount")
+        if retract is not None:
+            self._retraction = "{0} мм".format(retract)
         wall_count = value("wall_line_count")
         if isinstance(wall_count, dict):
             wall_count = wall_count.get("new", wall_count.get("value"))
@@ -1169,8 +1332,9 @@ class ChatController(QObject):
         summary = response.get("summary") if isinstance(response, dict) else {}
         self._update_parameters_from_dict(summary)
         if text:
-            self._last_recommendation = self._markdown_to_html(text)
-            self._messages.append_assistant(self._markdown_to_html(text), self._now())
+            rendered = self._markdown_to_html(text)
+            self._last_recommendation = rendered
+            self._messages.append_assistant(rendered, self._now())
             self.responseReady.emit(text)
             self.recommendationChanged.emit()
             self.messageAdded.emit()

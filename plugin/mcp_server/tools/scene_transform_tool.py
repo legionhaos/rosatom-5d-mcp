@@ -440,12 +440,13 @@ class SceneTransformTool(BaseMCPTool):
                 continue
             if hasattr(node, "getHull"):
                 continue
-            if hasattr(node, "callDecoration"):
-                try:
-                    if node.callDecoration("isNonPrintingMesh"):
-                        continue
-                except Exception:
-                    pass
+            if not hasattr(node, "callDecoration"):
+                continue
+            try:
+                if node.callDecoration("isNonPrintingMesh") or not node.callDecoration("isSliceable"):
+                    continue
+            except Exception:
+                continue
 
             # Ignore child mesh if parent is already a mesh
             parent = getattr(node, "getParent", lambda: None)()
@@ -459,15 +460,7 @@ class SceneTransformTool(BaseMCPTool):
         if sliceable:
             return sliceable
 
-        # 2. Prefer named nodes (ignoring empty or unnamed nodes like build plates)
-        named = [
-            n for n in candidates
-            if getattr(n, "getName", lambda: "")() and getattr(n, "getName", lambda: "")() not in ("", "Unnamed_Mesh")
-        ]
-        if named:
-            return named
-
-        return candidates
+        return []
 
     def _get_selected_mesh_node(self, scene):
         """Check if any mesh node is currently selected in Cura/Uranium."""
@@ -598,8 +591,7 @@ class SceneTransformTool(BaseMCPTool):
             "bottom_thickness",
             "infill_sparse_density",
             "infill_pattern",
-            "speed_print",
-            "layer_height"
+            "speed_print"
         }
 
         for raw_key, raw_value in print_parameters.items():

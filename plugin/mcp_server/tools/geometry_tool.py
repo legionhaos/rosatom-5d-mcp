@@ -146,7 +146,7 @@ class GeometryAnalysisTool(BaseMCPTool):
             overhang_threshold_deg = float(kwargs.get("overhang_threshold_deg", 45.0))
             if not 0.0 < overhang_threshold_deg < 90.0:
                 raise MeshError("overhang_threshold_deg must be between 0 and 90 degrees.")
-            if file_path and not os.path.isfile(file_path):
+            if file_path and os.path.isabs(file_path) and not os.path.isfile(file_path):
                 raise MeshError("File not found at specified path: {0}".format(file_path))
 
             mesh_data_bundle = self._dispatcher.run_sync(
@@ -177,6 +177,11 @@ class GeometryAnalysisTool(BaseMCPTool):
                         bounding_box["max_z"] = round(max_z, 3)
             except Exception:
                 pass
+            if any(float(bounding_box.get(key, 0.0)) <= 1e-6 for key in ("dx", "dy", "dz")):
+                raise MeshError(
+                    "Scene node reports zero-sized bounds; refusing to return invalid dimensions.",
+                    details={"file_path": file_path, "node_id": resolved_id,
+                             "node_name": resolved_name, "bounding_box_mm": bounding_box})
 
             mesh_local_bounds = self._compute_mesh_local_bounds(file_path, node_id)
             volume_mm3 = self._compute_signed_volume(triangles)
@@ -252,8 +257,12 @@ class GeometryAnalysisTool(BaseMCPTool):
             try:
                 if node.callDecoration("isNonPrintingMesh"):
                     return False
+                if not node.callDecoration("isSliceable"):
+                    return False
             except Exception:
-                pass
+                return False
+        else:
+            return False
         return True
 
     def _get_printable_candidates(self, scene):
@@ -280,15 +289,7 @@ class GeometryAnalysisTool(BaseMCPTool):
         if sliceable:
             return sliceable
 
-        # 2. Prefer named nodes (ignoring empty or unnamed nodes like build plates)
-        named = [
-            n for n in candidates
-            if getattr(n, "getName", lambda: "")() and getattr(n, "getName", lambda: "")() not in ("", "Unnamed_Mesh")
-        ]
-        if named:
-            return named
-
-        return candidates
+        return []
 
     def _get_selected_mesh_node(self, scene):
         """Check if any mesh node is currently selected in Cura/Uranium."""
@@ -342,8 +343,18 @@ class GeometryAnalysisTool(BaseMCPTool):
         if file_path:
             clean_file_path = str(file_path).strip()
             if clean_file_path:
+                requested_name = os.path.basename(clean_file_path).lower()
+                requested_stem = os.path.splitext(requested_name)[0]
+                for candidate in self._get_printable_candidates(scene):
+                    candidate_name = str(getattr(candidate, "getName", lambda: "")() or "").lower()
+                    candidate_stem = os.path.splitext(os.path.basename(candidate_name))[0]
+                    if candidate_name == requested_name or candidate_stem == requested_stem:
+                        return candidate
+
                 if not os.path.isfile(clean_file_path):
-                    raise MeshError("File not found at specified path: {}".format(clean_file_path))
+                    raise MeshError(
+                        "Model file is not an absolute/valid path and no loaded scene model matches it.",
+                        details={"file_path": clean_file_path, "requested_name": requested_name})
 
                 mesh_file_handler = app.getMeshFileHandler()
                 if not mesh_file_handler:
@@ -355,12 +366,22 @@ class GeometryAnalysisTool(BaseMCPTool):
                     if loaded:
                         loaded_nodes = loaded if isinstance(loaded, (list, tuple)) else [loaded]
                         loaded_candidates = [n for n in loaded_nodes if self._is_printable_node(n)]
-                        if loaded_candidates:
+                        for candidate in loaded_candidates:
+                            candidate_name = str(getattr(candidate, "getName", lambda: "")() or "").lower()
+                            if candidate_name == requested_name or os.path.splitext(os.path.basename(candidate_name))[0] == requested_stem:
+                                return candidate
+                        if len(loaded_candidates) == 1:
                             return loaded_candidates[0]
 
                 candidates = self._get_printable_candidates(scene)
+                for candidate in candidates:
+                    candidate_name = str(getattr(candidate, "getName", lambda: "")() or "").lower()
+                    if candidate_name == requested_name or os.path.splitext(os.path.basename(candidate_name))[0] == requested_stem:
+                        return candidate
                 if candidates:
-                    return candidates[-1]
+                    raise SceneError("Loaded models exist, but none matches the requested file.",
+                                     details={"file_path": clean_file_path,
+                                              "available_models": [getattr(n, "getName", lambda: "")() for n in candidates]})
 
         candidates = self._get_printable_candidates(scene)
         if candidates:

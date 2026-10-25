@@ -22,6 +22,10 @@ class ViewportCameraManager(object):
         # type: (Any) -> None
         self._app = application
         self._chat_window = None
+        self._target = None
+        self._distance = 350.0
+        self._yaw = -45.0
+        self._pitch = 35.264
 
     def _application(self):
         if self._app is not None:
@@ -43,7 +47,7 @@ class ViewportCameraManager(object):
 
     def focus_on_build_plate(self, view_angle="3d_isometric"):
         # type: (str) -> bool
-        return MainThreadDispatcher.run_sync(self._focus_impl, view_angle)
+        return MainThreadDispatcher.run_sync(self._focus_impl, "3d_isometric")
 
     def _focus_impl(self, view_angle):
         # type: (str) -> bool
@@ -57,25 +61,28 @@ class ViewportCameraManager(object):
         if controller is None:
             return False
 
-        camera = controller.getScene().getActiveCamera() if controller.getScene() else None
+        scene = controller.getScene()
+        camera = scene.getActiveCamera() if scene else None
         if camera is None:
             return False
 
+        target, radius = self._scene_target_and_radius(scene)
+        self._target = target
         presets = {
-            "3d_isometric": Vector(-250, 250, 250),
-            "isometric_alt": Vector(250, 250, 250),
-            "front": Vector(0, 100, 350),
-            "back": Vector(0, 100, -350),
-            "top": Vector(0, 420, 1),
-            "right": Vector(350, 100, 0),
-            "left": Vector(-350, 100, 0),
+            "3d_isometric": (-45.0, 35.264),
+            "isometric_alt": (45.0, 35.264),
+            "front": (0.0, 16.0),
+            "back": (180.0, 16.0),
+            "top": (0.0, 88.0),
+            "right": (90.0, 16.0),
+            "left": (-90.0, 16.0),
         }
-        target = presets.get(view_angle, presets["3d_isometric"])
+        self._yaw, self._pitch = presets.get(view_angle, presets["3d_isometric"])
+        self._distance = radius * (3.6 if view_angle in ("front", "back", "right", "left") else 2.7)
+        self._distance = max(90.0, min(1600.0, self._distance))
 
         try:
-            camera.setPosition(target)
-            if hasattr(camera, "lookAt"):
-                camera.lookAt(Vector(0, 0, 0))
+            self._set_camera_pose(camera, Vector, self._target, self._distance, self._yaw, self._pitch)
             return True
         except Exception as exc:
             logger.warning("focus_on_build_plate failed: %s", exc)
@@ -91,25 +98,121 @@ class ViewportCameraManager(object):
         if app is None:
             return False
         controller = app.getController()
-        if controller is None:
+        scene = controller.getScene() if controller else None
+        camera = scene.getActiveCamera() if scene else None
+        if camera is None:
             return False
-        camera = controller.getScene().getActiveCamera() if controller.getScene() else None
+        try:
+            from UM.Math.Vector import Vector
+            self._ensure_camera_state(scene, camera)
+            self._distance = max(50.0, min(1800.0, self._distance * float(factor)))
+            self._set_camera_pose(camera, Vector, self._target, self._distance, self._yaw, self._pitch)
+            return True
+        except Exception as exc:
+            logger.warning("zoom failed: %s", exc)
+            return False
+
+    def pan(self, delta_x, delta_y):
+        return MainThreadDispatcher.run_sync(self._pan_impl, delta_x, delta_y)
+
+    def _pan_impl(self, delta_x, delta_y):
+        app = self._application()
+        if app is None:
+            return False
+        controller = app.getController()
+        scene = controller.getScene() if controller else None
+        camera = scene.getActiveCamera() if scene else None
         if camera is None:
             return False
         try:
             from UM.Math.Vector import Vector
             import math
-            pos = camera.getPosition()
-            dist = math.sqrt(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z)
-            new_dist = max(90.0, min(950.0, dist * float(factor)))
-            ratio = new_dist / (dist if dist > 0 else 1.0)
-            camera.setPosition(Vector(pos.x * ratio, pos.y * ratio, pos.z * ratio))
-            if hasattr(camera, "lookAt"):
-                camera.lookAt(Vector(0, 0, 0))
+            self._ensure_camera_state(scene, camera)
+            yaw = math.radians(self._yaw)
+            right = (math.cos(yaw), 0.0, -math.sin(yaw))
+            up = (-math.sin(yaw) * math.sin(math.radians(self._pitch)),
+                  math.cos(math.radians(self._pitch)),
+                  -math.cos(yaw) * math.sin(math.radians(self._pitch)))
+            scale = self._distance * 0.0025
+            self._target = Vector(
+                self._target.x - (right[0] * float(delta_x) + up[0] * float(delta_y)) * scale,
+                self._target.y - (right[1] * float(delta_x) + up[1] * float(delta_y)) * scale,
+                self._target.z - (right[2] * float(delta_x) + up[2] * float(delta_y)) * scale)
+            self._set_camera_pose(camera, Vector, self._target, self._distance, self._yaw, self._pitch)
             return True
         except Exception as exc:
-            logger.warning("zoom failed: %s", exc)
+            logger.warning("pan failed: %s", exc)
             return False
+
+    def fit(self):
+        return MainThreadDispatcher.run_sync(self._fit_impl)
+
+    def _fit_impl(self):
+        self._target = None
+        return self._focus_impl("3d_isometric")
+
+    def _ensure_camera_state(self, scene, camera):
+        if self._target is None:
+            self._target, radius = self._scene_target_and_radius(scene)
+            pos = camera.getPosition()
+            dx, dy, dz = pos.x - self._target.x, pos.y - self._target.y, pos.z - self._target.z
+            import math
+            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            self._distance = distance if distance > 1.0 else radius * 2.7
+            self._yaw = math.degrees(math.atan2(dx, dz))
+            self._pitch = math.degrees(math.asin(max(-0.99, min(0.99, dy / self._distance))))
+
+    @staticmethod
+    def _scene_target_and_radius(scene):
+        from UM.Math.Vector import Vector
+        nodes = scene.getRoot().getAllChildren() if scene and hasattr(scene.getRoot(), "getAllChildren") else []
+        for node in nodes:
+            if not hasattr(node, "getMeshData") or node.getMeshData() is None:
+                continue
+            if type(node).__name__.lower().find("grid") >= 0 or type(node).__name__.lower().find("buildplate") >= 0:
+                continue
+            if hasattr(node, "callDecoration"):
+                try:
+                    if node.callDecoration("isNonPrintingMesh"):
+                        continue
+                except Exception:
+                    pass
+            box = getattr(node, "getBoundingBox", lambda: None)()
+            if box is None:
+                continue
+            try:
+                width = ViewportCameraManager._number(box, "width")
+                depth = ViewportCameraManager._number(box, "depth")
+                height = ViewportCameraManager._number(box, "height")
+                center = Vector(
+                    (ViewportCameraManager._number(box, "left") + ViewportCameraManager._number(box, "right")) / 2.0,
+                    (ViewportCameraManager._number(box, "bottom") + ViewportCameraManager._number(box, "top")) / 2.0,
+                    (ViewportCameraManager._number(box, "front") + ViewportCameraManager._number(box, "back")) / 2.0)
+                radius = max(35.0, math.sqrt(width * width + depth * depth + height * height) * 0.5)
+                return center, radius
+            except Exception:
+                pass
+        return Vector(0, 0, 0), 90.0
+
+    @staticmethod
+    def _number(obj, name):
+        value = getattr(obj, name, 0.0)
+        return float(value() if callable(value) else value)
+
+    @staticmethod
+    def _set_camera_pose(camera, vector_type, target, distance, yaw_deg, pitch_deg):
+        import math
+        yaw, pitch = math.radians(yaw_deg), math.radians(pitch_deg)
+        horizontal = distance * math.cos(pitch)
+        camera_position = vector_type(
+            target.x + horizontal * math.sin(yaw),
+            target.y + distance * math.sin(pitch),
+            target.z + horizontal * math.cos(yaw))
+        camera.setPosition(camera_position)
+        if hasattr(camera, "lookAt"):
+            camera.lookAt(target)
+        else:
+            camera.setViewCenter(target)
 
     def orbit(self, delta_yaw_deg, delta_pitch_deg):
         # type: (float, float) -> bool
@@ -123,30 +226,16 @@ class ViewportCameraManager(object):
         controller = app.getController()
         if controller is None:
             return False
-        camera = controller.getScene().getActiveCamera() if controller.getScene() else None
+        scene = controller.getScene()
+        camera = scene.getActiveCamera() if scene else None
         if camera is None:
             return False
         try:
             from UM.Math.Vector import Vector
-            import math
-            pos = camera.getPosition()
-            r = math.sqrt(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z)
-            if r < 10.0:
-                r = 350.0
-            yaw = math.atan2(pos.x, pos.z)
-            pitch = math.asin(max(-0.99, min(0.99, pos.y / r)))
-
-            yaw += math.radians(float(delta_yaw_deg))
-            pitch = max(math.radians(5.0), min(math.radians(85.0), pitch + math.radians(float(delta_pitch_deg))))
-
-            y = r * math.sin(pitch)
-            xz = r * math.cos(pitch)
-            x = xz * math.sin(yaw)
-            z = xz * math.cos(yaw)
-
-            camera.setPosition(Vector(x, y, z))
-            if hasattr(camera, "lookAt"):
-                camera.lookAt(Vector(0, 0, 0))
+            self._ensure_camera_state(scene, camera)
+            self._yaw += float(delta_yaw_deg)
+            self._pitch = max(-85.0, min(85.0, self._pitch + float(delta_pitch_deg)))
+            self._set_camera_pose(camera, Vector, self._target, self._distance, self._yaw, self._pitch)
             return True
         except Exception as exc:
             logger.warning("orbit failed: %s", exc)

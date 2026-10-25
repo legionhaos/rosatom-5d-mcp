@@ -168,20 +168,29 @@ class AgentOrchestrator(object):
             logger.debug("ReAct iteration %d/%d: calling LLM with %d messages",
                          iteration, self.max_iterations, len(messages))
 
-            # The automated pipeline consists of 3 steps: geometry, mode/profile, scene/parameters.
-            # Slicing and G-code generation tools run ONLY upon explicit user request (Export button).
+            # Check if this conversation turn is a follow-up request or initial analysis pipeline
+            has_prior_analysis = any(
+                m.get("role") == "tool" and m.get("name") in ("analyze_mesh_geometry", "select_print_mode_and_profile")
+                for m in self.context_mgr.messages
+            )
+
             allowed_tools = {"analyze_mesh_geometry", "select_print_mode_and_profile", "modify_scene_and_parameters"}
             step_tools = [t for t in (tools_schema or []) if t.get("function", {}).get("name") in allowed_tools]
 
-            if not executed_tools.get("analyze_mesh_geometry"):
-                current_tool_choice = {"type": "function", "function": {"name": "analyze_mesh_geometry"}}
-            elif not executed_tools.get("select_print_mode_and_profile"):
-                current_tool_choice = {"type": "function", "function": {"name": "select_print_mode_and_profile"}}
-            elif not executed_tools.get("modify_scene_and_parameters"):
-                current_tool_choice = {"type": "function", "function": {"name": "modify_scene_and_parameters"}}
+            if has_prior_analysis:
+                # In follow-up turns (e.g. asking for adjustments or clarifications), allow LLM to choose tools or reply directly
+                current_tool_choice = "auto"
             else:
-                current_tool_choice = "none"
-                step_tools = None
+                # Automated pipeline on initial turn: geometry -> profile/material -> scene/parameters -> report
+                if not executed_tools.get("analyze_mesh_geometry"):
+                    current_tool_choice = {"type": "function", "function": {"name": "analyze_mesh_geometry"}}
+                elif not executed_tools.get("select_print_mode_and_profile"):
+                    current_tool_choice = {"type": "function", "function": {"name": "select_print_mode_and_profile"}}
+                elif not executed_tools.get("modify_scene_and_parameters"):
+                    current_tool_choice = {"type": "function", "function": {"name": "modify_scene_and_parameters"}}
+                else:
+                    current_tool_choice = "none"
+                    step_tools = None
 
             try:
                 llm_response = self.llm_client.chat_completion(
@@ -251,37 +260,36 @@ class AgentOrchestrator(object):
                 continue
 
             else:
-                # Do not accept a final answer before geometry analysis. Some providers
-                # ignore tool_choice, so explicitly request the first mandatory step.
-                if tools_schema and not executed_tools.get("analyze_mesh_geometry"):
-                    logger.warning("LLM returned text before mandatory geometry analysis.")
-                    self.context_mgr.add_assistant_message(llm_response.content or "")
-                    self.context_mgr.add_user_turn(
-                        "Выполни обязательный первый MCP-вызов analyze_mesh_geometry сейчас. "
-                        "Не отвечай текстом и используй текущую модель сцены, если file_path не указан."
-                    )
-                    continue
-                if tools_schema and not executed_tools.get("select_print_mode_and_profile") and (snapshot.get("loaded_models") or self.context_mgr.attached_models):
-                    logger.warning("LLM returned text before mandatory select_print_mode_and_profile.")
-                    self.context_mgr.add_assistant_message(llm_response.content or "")
-                    self.context_mgr.add_user_turn(
-                        "Выполни обязательный следующий шаг конвейера: MCP-вызов select_print_mode_and_profile. "
-                        "Выбери mode ('3D' или '5D') и материал из доступных материалов слайсера. "
-                        "Не отвечай текстом до выполнения вызова."
-                    )
-                    continue
-
-                if tools_schema and not executed_tools.get("modify_scene_and_parameters") and (snapshot.get("loaded_models") or self.context_mgr.attached_models):
-                    logger.warning("LLM returned text before mandatory modify_scene_and_parameters.")
-                    self.context_mgr.add_assistant_message(llm_response.content or "")
-                    self.context_mgr.add_user_turn(
-                        "Выполни обязательный следующий шаг конвейера: MCP-вызов modify_scene_and_parameters. "
-                        "Примени пространственную ориентацию детали (rotation_euler_deg из best_orientation) "
-                        "и параметры нарезки (print_parameters: layer_height, wall_line_count, infill_sparse_density, "
-                        "material_print_temperature, material_bed_temperature; supports_enabled). "
-                        "Не отвечай текстом до выполнения вызова."
-                    )
-                    continue
+                # If this is an initial pipeline run and the model skipped mandatory tool calls:
+                if not has_prior_analysis and iteration < 4:
+                    if tools_schema and not executed_tools.get("analyze_mesh_geometry"):
+                        logger.warning("LLM returned text before mandatory geometry analysis.")
+                        self.context_mgr.add_assistant_message(llm_response.content or "")
+                        self.context_mgr.add_user_turn(
+                            "Выполни обязательный первый MCP-вызов analyze_mesh_geometry сейчас. "
+                            "Не отвечай текстом и используй текущую модель сцены, если file_path не указан."
+                        )
+                        continue
+                    if tools_schema and not executed_tools.get("select_print_mode_and_profile") and (snapshot.get("loaded_models") or self.context_mgr.attached_models):
+                        logger.warning("LLM returned text before mandatory select_print_mode_and_profile.")
+                        self.context_mgr.add_assistant_message(llm_response.content or "")
+                        self.context_mgr.add_user_turn(
+                            "Выполни обязательный следующий шаг конвейера: MCP-вызов select_print_mode_and_profile. "
+                            "Выбери mode ('3D' или '5D') и материал из доступных материалов слайсера. "
+                            "Не отвечай текстом до выполнения вызова."
+                        )
+                        continue
+                    if tools_schema and not executed_tools.get("modify_scene_and_parameters") and (snapshot.get("loaded_models") or self.context_mgr.attached_models):
+                        logger.warning("LLM returned text before mandatory modify_scene_and_parameters.")
+                        self.context_mgr.add_assistant_message(llm_response.content or "")
+                        self.context_mgr.add_user_turn(
+                            "Выполни обязательный следующий шаг конвейера: MCP-вызов modify_scene_and_parameters. "
+                            "Примени пространственную ориентацию детали (rotation_euler_deg из best_orientation) "
+                            "и параметры нарезки (print_parameters: layer_height, wall_line_count, infill_sparse_density, "
+                            "material_print_temperature, material_bed_temperature; supports_enabled). "
+                            "Не отвечай текстом до выполнения вызова."
+                        )
+                        continue
 
                 # No tool calls: final engineering answer received
                 final_answer = llm_response.content or ""
@@ -340,6 +348,15 @@ class AgentOrchestrator(object):
             "print_time_formatted": "",
             "material_weight_g": None,
             "filament_length_m": None,
+            "first_layer_height_mm": None,
+            "nozzle_diameter_mm": None,
+            "first_layer_temperature_c": None,
+            "adhesion_type": "",
+            "print_speed_mm_s": None,
+            "retraction_amount_mm": None,
+            "top_layers": None,
+            "bottom_layers": None,
+            "brim_width_mm": None,
             "status": "recommendation"
         }
 
@@ -354,7 +371,10 @@ class AgentOrchestrator(object):
             key_params = snapshot.get("key_parameters") or {}
             for k in ("layer_height_mm", "wall_line_count", "infill_density_pct",
                       "infill_pattern", "print_temperature_c", "bed_temperature_c",
-                      "fan_speed_pct", "support_enabled"):
+                      "fan_speed_pct", "support_enabled", "nozzle_diameter_mm",
+                      "first_layer_height_mm", "first_layer_temperature_c", "adhesion_type",
+                      "print_speed_mm_s", "retraction_amount_mm", "top_layers",
+                      "bottom_layers", "brim_width_mm"):
                 if k in key_params:
                     card[k] = key_params[k]
 
@@ -374,6 +394,32 @@ class AgentOrchestrator(object):
             if "applied_rotation_deg" in mod_tool or "applied_rotation_euler_deg" in mod_tool:
                 card["rotation_deg"] = mod_tool.get("applied_rotation_deg") or mod_tool.get("applied_rotation_euler_deg")
             params = mod_tool.get("applied_parameters") or mod_tool.get("applied_overrides") or {}
+            aliases = {
+                "layer_height": "layer_height_mm",
+                "layer_height_0": "first_layer_height_mm",
+                "wall_line_count": "wall_line_count",
+                "infill_sparse_density": "infill_density_pct",
+                "infill_pattern": "infill_pattern",
+                "material_print_temperature": "print_temperature_c",
+                "material_print_temperature_layer_0": "first_layer_temperature_c",
+                "material_bed_temperature": "bed_temperature_c",
+                "cool_fan_speed": "fan_speed_pct",
+                "support_enable": "support_enabled",
+                "speed_print": "print_speed_mm_s",
+                "retraction_amount": "retraction_amount_mm",
+                "top_layers": "top_layers",
+                "bottom_layers": "bottom_layers",
+                "brim_width": "brim_width_mm",
+                "adhesion_type": "adhesion_type",
+                "machine_nozzle_size": "nozzle_diameter_mm",
+                "nozzle_diameter_mm": "nozzle_diameter_mm",
+            }
+            for source_key, target_key in aliases.items():
+                if source_key in params:
+                    item = params[source_key]
+                    if isinstance(item, dict):
+                        item = item.get("new", item.get("value"))
+                    card[target_key] = item
             for k in ("layer_height_mm", "wall_line_count", "infill_density_pct",
                       "infill_pattern", "print_temperature_c", "bed_temperature_c",
                       "fan_speed_pct", "support_enabled"):

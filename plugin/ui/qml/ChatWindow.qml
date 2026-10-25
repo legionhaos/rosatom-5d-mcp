@@ -188,7 +188,7 @@ Window {
 
         var promptText = "Проанализируй прикреплённую модель для печати на Stereotech Hybrid 530. Цель: " +
             selectedGoal + ". " + customGoal.text +
-            ". Определи оптимальный режим 3D/5D, материал, сопло, ориентацию, поддержки и подготовь инженерное обоснование. Пока не применяй изменения к сцене и не запускай слайсинг: используй геометрию и подбор профиля.";
+            ". Определи оптимальный режим 3D/5D, материал, сопло, ориентацию, поддержки, примени ориентацию и параметры к сцене и подготовь инженерное обоснование. Слайсинг пока не запускай.";
         submitPrompt(promptText);
     }
 
@@ -218,15 +218,30 @@ Window {
     }
 
     function finishPhase(text) {
+        var replyText = "";
+        if (typeof text === "string" && text.length > 0) {
+            replyText = text;
+        } else if (activeCtrl && activeCtrl.lastRecommendation && activeCtrl.lastRecommendation.length > 0) {
+            replyText = activeCtrl.lastRecommendation;
+        }
+
         if (phase === "analyze") {
             analysisIndex = 5;
-            if (text) changeMessages.append({"role": "assistant", "text": text});
+            if (replyText.length > 0) {
+                changeMessages.append({"role": "assistant", "text": replyText});
+            }
             phase = "recommend";
         } else if (phase === "apply") {
             applyIndex = 5;
             phase = "done";
-        } else if (phase === "recommend" && text) {
-            changeMessages.append({"role": "assistant", "text": text});
+        } else if (phase === "recommend" && replyText.length > 0) {
+            var lastIdx = changeMessages.count - 1;
+            var isDup = lastIdx >= 0 &&
+                        changeMessages.get(lastIdx).role === "assistant" &&
+                        changeMessages.get(lastIdx).text === replyText;
+            if (!isDup) {
+                changeMessages.append({"role": "assistant", "text": replyText});
+            }
         }
     }
 
@@ -286,27 +301,45 @@ Window {
             }
         }
         onToolStarted: {
-            if (root.phase === "analyze") root.setAnalysisStep(arguments[0]);
-            if (root.phase === "apply") root.setApplyStep(arguments[0]);
+            var tName = (typeof toolName !== "undefined" && toolName !== null) ? toolName : (typeof arguments !== "undefined" && arguments.length > 0 ? arguments[0] : "");
+            if (root.phase === "analyze") root.setAnalysisStep(tName);
+            if (root.phase === "apply") root.setApplyStep(tName);
         }
         onToolFinished: {
             root.finishedTools += 1;
             if (root.phase === "analyze") root.analysisDetail = "Анализ данных инструмента завершён, агент выбирает следующий шаг…";
         }
-        onResponseReady: root.finishPhase(arguments[0])
+        onResponseReady: {
+            var t = (typeof text !== "undefined" && text !== null) ? text : (typeof arguments !== "undefined" && arguments.length > 0 ? arguments[0] : "");
+            root.finishPhase(t);
+        }
         onTaskFinished: {
-            if (root.phase === "analyze" || root.phase === "apply") root.finishPhase("");
+            if (root.phase === "analyze" || root.phase === "apply") {
+                root.finishPhase("");
+            }
         }
         onTaskFailed: {
-            root.lastError = arguments[0] || "Не удалось завершить операцию агента.";
+            var err = (typeof msg !== "undefined" && msg !== null) ? msg : (typeof arguments !== "undefined" && arguments.length > 0 ? arguments[0] : "Не удалось завершить операцию агента.");
+            root.lastError = err;
             root.phase = "error";
         }
+        onParameterApplyFinished: {
+            var isOk = (typeof ok !== "undefined" && ok !== null) ? ok : (typeof arguments !== "undefined" && arguments.length > 0 ? arguments[0] : false);
+            var textMsg = (typeof msg !== "undefined" && msg !== null) ? msg : (typeof arguments !== "undefined" && arguments.length > 1 ? arguments[1] : "");
+            if (isOk) {
+                root.applyIndex = 5;
+                root.phase = "done";
+            } else {
+                root.lastError = textMsg;
+                root.phase = "error";
+            }
+        }
         onExportFinished: {
-            var ok = arguments[0];
-            var msg = arguments[1];
-            if (ok) {
+            var isOk = (typeof ok !== "undefined" && ok !== null) ? ok : (typeof arguments !== "undefined" && arguments.length > 0 ? arguments[0] : false);
+            var textMsg = (typeof msg !== "undefined" && msg !== null) ? msg : (typeof arguments !== "undefined" && arguments.length > 1 ? arguments[1] : "");
+            if (isOk) {
                 exportNoticeBanner.visible = true;
-                exportNoticeText.text = "✓ " + msg;
+                exportNoticeText.text = "✓ " + textMsg;
             }
         }
     }
@@ -1234,15 +1267,21 @@ Window {
 
                                 Repeater {
                                     model: [
-                                        ["Профиль качества", activeCtrl ? activeCtrl.profileName : "5D Structural"],
-                                        ["Высота слоя", activeCtrl ? activeCtrl.layerHeight : "0.20 мм"],
-                                        ["Сопло", "0.4 мм · закалённое"],
-                                        ["Заполнение детали", (activeCtrl ? activeCtrl.infillDensity : "50%") + " (" + (activeCtrl ? activeCtrl.infillPattern : "Gyroid") + ")"],
-                                        ["Стенки", activeCtrl ? activeCtrl.wallLineCount : "4 линии"],
-                                        ["Температура сопла / стола", (activeCtrl ? activeCtrl.printTemperature : "275 °C") + " / " + (activeCtrl ? activeCtrl.bedTemperature : "90 °C")],
-                                        ["Поддержки детали", activeCtrl ? activeCtrl.supportText : "Отключены (5D)"],
-                                        ["Расчётное время", activeCtrl && activeCtrl.printTime ? activeCtrl.printTime : "~ 1 ч 15 мин"],
-                                        ["Расход материала", activeCtrl && activeCtrl.materialUsage ? activeCtrl.materialUsage : "~ 48.5 г"]
+                                        ["Профиль качества", (activeCtrl && activeCtrl.profileName) ? activeCtrl.profileName : "—"],
+                                        ["Слой / первый слой", (activeCtrl && activeCtrl.layerHeight) ? activeCtrl.layerHeight : "—"],
+                                        ["Сопло", (activeCtrl && activeCtrl.nozzleDiameter) ? activeCtrl.nozzleDiameter : "—"],
+                                        ["Заполнение / паттерн", ((activeCtrl && activeCtrl.infillDensity) ? activeCtrl.infillDensity : "—") + " (" + ((activeCtrl && activeCtrl.infillPattern) ? activeCtrl.infillPattern : "—") + ")"],
+                                        ["Стенки / верх-низ", ((activeCtrl && activeCtrl.wallLineCount) ? activeCtrl.wallLineCount : "—") + " / " + ((activeCtrl && activeCtrl.topBottomThickness) ? activeCtrl.topBottomThickness : "—")],
+                                        ["Температура сопла / стола", ((activeCtrl && activeCtrl.printTemperature) ? activeCtrl.printTemperature : "—") + " / " + ((activeCtrl && activeCtrl.bedTemperature) ? activeCtrl.bedTemperature : "—")],
+                                        ["Температура первого слоя", (activeCtrl && activeCtrl.firstLayerTemperature) ? activeCtrl.firstLayerTemperature : "—"],
+                                        ["Обдув детали", (activeCtrl && activeCtrl.fanSpeed) ? activeCtrl.fanSpeed : "—"],
+                                        ["Поддержки / адгезия", ((activeCtrl && activeCtrl.supportText) ? activeCtrl.supportText : "—") + " / " + ((activeCtrl && activeCtrl.adhesionType) ? activeCtrl.adhesionType : "—")],
+                                        ["Ширина каймы", (activeCtrl && activeCtrl.brimWidth) ? activeCtrl.brimWidth : "—"],
+                                        ["Скорость печати", (activeCtrl && activeCtrl.printSpeed) ? activeCtrl.printSpeed : "—"],
+                                        ["Ретракт", (activeCtrl && activeCtrl.retraction) ? activeCtrl.retraction : "—"],
+                                        ["Ориентация", (activeCtrl && activeCtrl.rotationText) ? activeCtrl.rotationText : "—"],
+                                        ["Расчётное время", (activeCtrl && activeCtrl.printTime) ? activeCtrl.printTime : "—"],
+                                        ["Расход материала", (activeCtrl && activeCtrl.materialUsage) ? activeCtrl.materialUsage : "—"]
                                     ]
 
                                     delegate: Rectangle {
@@ -1254,7 +1293,7 @@ Window {
                                             anchors.left: parent.left
                                             anchors.leftMargin: 8
                                             anchors.verticalCenter: parent.verticalCenter
-                                            text: modelData[0]
+                                            text: (modelData && typeof modelData[0] !== "undefined" && modelData[0] !== null) ? ("" + modelData[0]) : ""
                                             color: root.muted
                                             font.pixelSize: 10
                                         }
@@ -1263,7 +1302,7 @@ Window {
                                             anchors.right: parent.right
                                             anchors.rightMargin: 8
                                             anchors.verticalCenter: parent.verticalCenter
-                                            text: modelData[1]
+                                            text: (modelData && typeof modelData[1] !== "undefined" && modelData[1] !== null) ? ("" + modelData[1]) : "—"
                                             color: index === 0 || index === 1 || index === 3 ? root.primary : root.ink
                                             font.pixelSize: 10
                                             font.bold: index === 0 || index === 1
@@ -1339,34 +1378,120 @@ Window {
                             }
 
                             // Chat Messages List
-                            ListView {
-                                id: changeList
+                            Item {
                                 width: parent.width
-                                height: parent.height - 145
-                                clip: true
-                                spacing: 6
-                                model: changeMessages
-                                onCountChanged: positionViewAtEnd()
+                                height: parent.height - (activeCtrl && activeCtrl.busy ? 190 : 135)
 
-                                delegate: Rectangle {
-                                    width: changeList.width
-                                    height: msgText.implicitHeight + 20
-                                    radius: 8
-                                    color: model.role === "user" ? root.primarySoft : "#f8fafc"
-                                    border.color: model.role === "user" ? root.primaryBorder : root.border
-                                    border.width: 1
+                                ListView {
+                                    id: changeList
+                                    anchors.fill: parent
+                                    clip: true
+                                    spacing: 8
+                                    model: changeMessages
+                                    onCountChanged: positionViewAtEnd()
 
-                                    Text {
-                                        id: msgText
-                                        anchors.fill: parent
-                                        anchors.margins: 10
-                                        text: model.role === "assistant" && activeCtrl
-                                              ? activeCtrl.renderMarkdown(model.text)
-                                              : model.text
-                                        textFormat: model.role === "assistant" ? Text.RichText : Text.PlainText
-                                        color: root.ink
-                                        font.pixelSize: 14
-                                        wrapMode: Text.Wrap
+                                    delegate: Rectangle {
+                                        id: msgCard
+                                        width: changeList.width
+                                        height: Math.max(34, msgText.paintedHeight + 20)
+                                        radius: 8
+                                        color: model.role === "user" ? root.primarySoft : "#f8fafc"
+                                        border.color: model.role === "user" ? root.primaryBorder : root.border
+                                        border.width: 1
+
+                                        Text {
+                                            id: msgText
+                                            x: 10
+                                            y: 10
+                                            width: Math.max(10, msgCard.width - 20)
+                                            text: (model.text && activeCtrl && model.role === "assistant")
+                                                  ? activeCtrl.renderMarkdown(model.text)
+                                                  : (model.text || "")
+                                            textFormat: model.role === "assistant" ? Text.RichText : Text.PlainText
+                                            color: root.ink
+                                            font.pixelSize: 12
+                                            wrapMode: Text.Wrap
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    anchors.bottom: parent.bottom
+                                    anchors.margins: 2
+                                    width: 4
+                                    radius: 2
+                                    color: "#000000"
+                                    opacity: changeList.moving ? 0.3 : 0.08
+                                    visible: changeList.contentHeight > changeList.height
+
+                                    Rectangle {
+                                        y: changeList.visibleArea.yPosition * parent.height
+                                        width: parent.width
+                                        height: Math.max(16, changeList.visibleArea.heightRatio * parent.height)
+                                        radius: 2
+                                        color: root.primary
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                width: parent.width
+                                height: activeCtrl && activeCtrl.busy ? 56 : 0
+                                visible: activeCtrl && activeCtrl.busy
+                                radius: 9
+                                color: activeCtrl && activeCtrl.assistantHealthy ? "#eff6ff" : "#fff7ed"
+                                border.color: activeCtrl && activeCtrl.assistantHealthy ? "#bfdbfe" : "#fdba74"
+                                border.width: 1
+
+                                Row {
+                                    anchors.fill: parent
+                                    anchors.margins: 9
+                                    spacing: 9
+
+                                    Rectangle {
+                                        width: 28
+                                        height: 28
+                                        radius: 14
+                                        color: "#dbeafe"
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: "✦"
+                                            color: "#2563eb"
+                                            font.pixelSize: 14
+                                        }
+                                        RotationAnimation on rotation {
+                                            from: 0
+                                            to: 360
+                                            duration: 1800
+                                            loops: Animation.Infinite
+                                            running: activeCtrl && activeCtrl.busy && activeCtrl.assistantHealthy
+                                        }
+                                    }
+
+                                    Column {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: parent.width - 48
+                                        spacing: 2
+                                        Text {
+                                            width: parent.width
+                                            text: activeCtrl && activeCtrl.assistantHealthy
+                                                  ? ((activeCtrl.assistantStatus || "ИИ думает") + " · " + activeCtrl.assistantElapsedSec + " сек")
+                                                  : "Похоже, ответ задерживается"
+                                            color: activeCtrl && activeCtrl.assistantHealthy ? "#1d4ed8" : "#c2410c"
+                                            font.pixelSize: 10
+                                            font.bold: true
+                                            elide: Text.ElideRight
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            text: activeCtrl ? (activeCtrl.assistantStatusDetail || "Ожидаю ответ модели…") : ""
+                                            color: "#64748b"
+                                            font.pixelSize: 9
+                                            elide: Text.ElideRight
+                                        }
                                     }
                                 }
                             }

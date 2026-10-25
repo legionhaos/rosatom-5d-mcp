@@ -402,8 +402,6 @@ class ConversationContextManager(object):
                         continue
                     if hasattr(child, "getHull"):
                         continue
-                    if hasattr(child, "getHull"):
-                        continue
 
                     # Skip explicitly non-printing meshes and nested mesh components;
                     # valid models can have no name or lack Cura's isSliceable decoration.
@@ -416,6 +414,15 @@ class ConversationContextManager(object):
                     parent = getattr(child, "getParent", lambda: None)()
                     parent_mesh_getter = getattr(parent, "getMeshData", None) if parent is not None else None
                     if callable(parent_mesh_getter) and parent_mesh_getter() is not None:
+                        continue
+                    sliceable = False
+                    for candidate in (child, parent):
+                        if candidate is not None and hasattr(candidate, "callDecoration"):
+                            try:
+                                sliceable = bool(candidate.callDecoration("isSliceable")) or sliceable
+                            except Exception:
+                                pass
+                    if not sliceable:
                         continue
 
                     try:
