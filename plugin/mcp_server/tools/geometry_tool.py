@@ -194,7 +194,9 @@ class GeometryAnalysisTool(BaseMCPTool):
                 overhang_threshold_deg
             )
 
-            best_candidate = candidates[0] if candidates else None
+            # AI model rotation is disabled: evaluate the model strictly in its original orientation on the build plate
+            original_candidate = next((c for c in candidates if c.get("label") == "Original"), (candidates[0] if candidates else None))
+            best_candidate = original_candidate
 
             requires_supports = best_candidate["requires_supports_in_3d"] if best_candidate else False
             is_5d_beneficial = best_candidate["is_5d_beneficial"] if best_candidate else False
@@ -223,7 +225,7 @@ class GeometryAnalysisTool(BaseMCPTool):
                     "recommended_mode": recommended_mode
                 },
                 "best_orientation": best_candidate,
-                "orientation_candidates": candidates[:3] if candidates else []
+                "orientation_candidates": [original_candidate] if original_candidate else []
             }
 
         except STEPluginError as exc:

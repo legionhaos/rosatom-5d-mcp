@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import logging
 import math
 import os
 import sys
 import traceback
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger("SceneTransformTool")
 
 try:
     from plugin.mcp_server.server import BaseMCPTool
@@ -122,7 +125,7 @@ class SceneTransformTool(BaseMCPTool):
                 "items": {"type": "number"},
                 "minItems": 3,
                 "maxItems": 3,
-                "description": "Rotation angles [rx, ry, rz] in degrees in print coordinate space (Z-up)."
+                "description": "Deprecated/Disabled: Rotation by AI is disabled to preserve user's manual orientation. Always keep [0.0, 0.0, 0.0]."
             },
             "position_xy_mm": {
                 "type": "array",
@@ -262,8 +265,14 @@ class SceneTransformTool(BaseMCPTool):
             from cura.CuraApplication import CuraApplication
         except ImportError:
             CuraApplication = None
-        from UM.Math.Quaternion import Quaternion
-        from UM.Math.Vector import Vector
+        try:
+            from UM.Math.Quaternion import Quaternion
+        except ImportError:
+            Quaternion = None
+        try:
+            from UM.Math.Vector import Vector
+        except ImportError:
+            Vector = None
 
         app = self._application_override
         if app is None:
@@ -300,23 +309,10 @@ class SceneTransformTool(BaseMCPTool):
             node.setScale(Vector(current_scale.x * factor, current_scale.y * factor, current_scale.z * factor))
             applied_scale = factor
 
-        applied_rotation = None
+        # AI rotation of the model is disabled: keep model orientation unchanged as placed by user
+        applied_rotation = [0.0, 0.0, 0.0]
         if rotation_euler_deg is not None:
-            if not isinstance(rotation_euler_deg, (list, tuple)) or len(rotation_euler_deg) != 3:
-                raise STEPluginError("Parameter rotation_euler_deg must contain 3 numbers [rx, ry, rz].")
-
-            rx = float(rotation_euler_deg[0])
-            ry = float(rotation_euler_deg[1])
-            rz = float(rotation_euler_deg[2])
-
-            qx = Quaternion.fromAngleAxis(math.radians(-rx), Vector(1, 0, 0))
-            qy = Quaternion.fromAngleAxis(math.radians(-ry), Vector(0, 0, 1))
-            qz = Quaternion.fromAngleAxis(math.radians(-rz), Vector(0, 1, 0))
-
-            rot_quat = qz * qy * qx
-            current_orient = node.getOrientation()
-            node.setOrientation(rot_quat * current_orient)
-            applied_rotation = [rx, ry, rz]
+            logger.info("modify_scene_and_parameters: AI rotation request %s ignored to preserve user's manual orientation.", rotation_euler_deg)
 
         self._drop_node_to_build_plate(node)
 

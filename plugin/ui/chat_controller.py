@@ -359,8 +359,10 @@ class ChatController(QObject):
     def rotationText(self):
         rot = self._rotation_deg
         if isinstance(rot, (list, tuple)) and len(rot) >= 3:
+            if abs(rot[0]) < 1e-3 and abs(rot[1]) < 1e-3 and abs(rot[2]) < 1e-3:
+                return "Исходная (без вращения)"
             return "X: {0:.0f}°, Y: {1:.0f}°, Z: {2:.0f}°".format(rot[0], rot[1], rot[2])
-        return "Без поворота"
+        return "Исходная (без вращения)"
 
     @pyqtProperty(str, notify=recommendationChanged)
     def lastRecommendation(self):

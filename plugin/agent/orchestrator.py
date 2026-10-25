@@ -291,8 +291,8 @@ class AgentOrchestrator(object):
                         self.context_mgr.add_assistant_message(llm_response.content or "")
                         self.context_mgr.add_user_turn(
                             "Выполни обязательный следующий шаг конвейера: MCP-вызов modify_scene_and_parameters. "
-                            "Примени пространственную ориентацию детали (rotation_euler_deg из best_orientation) "
-                            "и параметры нарезки (print_parameters: layer_height, wall_line_count, infill_sparse_density, "
+                            "НЕ поворачивай деталь (сохрани исходную ориентацию пользователя, rotation_euler_deg=[0.0, 0.0, 0.0]) "
+                            "и примени параметры нарезки (print_parameters: layer_height, wall_line_count, infill_sparse_density, "
                             "material_print_temperature, material_bed_temperature; supports_enabled). "
                             "Не отвечай текстом до выполнения вызова."
                         )
@@ -492,8 +492,8 @@ class AgentOrchestrator(object):
             walls = params.get("wall_line_count") or 4
             if isinstance(walls, dict):
                 walls = walls.get("new", 4)
-            return "Применена ориентация (X:{0}°, Y:{1}°, Z:{2}°), температура {3}°C, {4} стенки.".format(
-                rot[0], rot[1], rot[2], temp, walls
+            return "Сохранена исходная ориентация модели, температура {0}°C, {1} стенки.".format(
+                temp, walls
             )
 
         elif tool_name == "run_slicing_and_generate_gcode":
